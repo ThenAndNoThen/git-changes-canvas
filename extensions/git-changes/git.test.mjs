@@ -39,7 +39,7 @@ before(async () => {
     lines[1] = "line TWO updated";
     lines[24] = "line TWENTY-FIVE updated";
     await writeFile(join(repo, "changes.txt"), lines.join("\n") + "\n");
-    await rename(join(repo, "old name.txt"), join(repo, "renamed 文件.txt"));
+    await rename(join(repo, "old name.txt"), join(repo, "renamed café.txt"));
     await rm(join(repo, "delete.txt"));
     await writeFile(join(repo, "binary.bin"), Buffer.from([0, 1, 8, 9]));
     await writeFile(join(repo, "bracket[1].txt"), "literal changed\n");
@@ -74,9 +74,9 @@ test("A...B excludes A-only changes while A B includes them", async () => {
 });
 
 test("local Git objects preserve deleted and un-checked-out files, binary and empty-file stats", async () => {
-    const renamed = result.files.find((file) => file.path === "renamed 文件.txt");
+    const renamed = result.files.find((file) => file.path === "renamed café.txt");
     assert.equal(renamed.oldPath, null);
-    assert.equal(renamed.path, "renamed 文件.txt");
+    assert.equal(renamed.path, "renamed café.txt");
     assert.equal(renamed.status, "A");
     assert.equal(renamed.additions, 1);
     assert.equal(result.files.find((file) => file.path === "binary.bin").binary, true);
