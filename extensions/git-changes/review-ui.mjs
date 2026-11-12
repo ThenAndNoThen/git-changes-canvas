@@ -34,6 +34,19 @@ export function createReviewUI({ request, getState, openAnchor, showError }) {
         if (thread.messages.some((message) => message.author === "agent" && message.replyTo === lastUser.id)) return "Agent replied · Awaiting your decision";
         return { pending: "Saved · Sending or awaiting confirmation", sent: "Sent to conversation · Awaiting reply", uncertain: "Delivery uncertain · Check the conversation before sending again" }[lastUser.delivery.state];
     }
+    function currentSelection() {
+        const state = getState();
+        return selection?.comparisonId === state.comparison?.id && selection?.path === state.currentFile?.path;
+    }
+    function updateCommentButtons() {
+        const state = getState();
+        for (const button of $("diff").querySelectorAll(".line-comment")) {
+            const number = button.parentElement;
+            button.disabled = !enabled || posting || typeof state.currentFile?.sources?.[number.dataset.sourceSide]?.text !== "string";
+            number.classList.toggle("selection-end", !!selection && currentSelection()
+                && selection.side === number.dataset.sourceSide && selection.endLine === Number(number.dataset.line));
+        }
+    }
     function navigation() {
         const visible = threads.filter((thread) => !thread.resolved);
         const index = visible.findIndex((thread) => thread.id === activeId);
@@ -41,7 +54,7 @@ export function createReviewUI({ request, getState, openAnchor, showError }) {
         $("comment-prev").disabled = posting || index <= 0;
         $("comment-next").disabled = posting || index >= visible.length - 1;
         $("review-toggle").textContent = `Comments ${visible.length}${threads.length > visible.length ? ` · Resolved ${threads.length - visible.length}` : ""}`;
-        $("add-comment").disabled = !enabled || !selection || posting;
+        updateCommentButtons();
     }
     function dock() {
         $("review-panel").hidden = false;
@@ -57,16 +70,24 @@ export function createReviewUI({ request, getState, openAnchor, showError }) {
                 number.dataset.sourceSide = cell.dataset.sourceSide;
                 number.dataset.line = cell.dataset.line;
                 number.tabIndex = 0;
-                number.setAttribute("role", "button");
-                number.setAttribute("aria-label", `Comment on ${cell.dataset.sourceSide === "base" ? "A" : "B"} line ${cell.dataset.line}; Shift-click to select multiple lines`);
+                number.setAttribute("aria-label", `Select ${cell.dataset.sourceSide === "base" ? "A" : "B"} line ${cell.dataset.line}; Shift-click to select multiple lines`);
+                if (!number.querySelector(".line-comment")) {
+                    const label = element("span", "line-number", number.textContent);
+                    const button = element("button", "line-comment", "+");
+                    button.type = "button";
+                    button.title = "Add comment";
+                    button.setAttribute("aria-label", `Add comment on ${cell.dataset.sourceSide === "base" ? "A" : "B"} line ${cell.dataset.line}`);
+                    number.replaceChildren(button, label);
+                }
             }
             const matches = threads.filter((thread) => !thread.resolved && thread.anchor.path === state.currentFile?.path
                 && !stale(thread) && thread.anchor.side === cell.dataset.sourceSide
                 && Number(cell.dataset.line) >= thread.anchor.startLine && Number(cell.dataset.line) <= thread.anchor.endLine);
             cell.classList.toggle("review-highlight", matches.some((thread) => thread.id === activeId));
             number?.classList.toggle("has-review", matches.length > 0);
-            if (number) number.title = matches.length ? `${matches.length} unresolved comments` : "Click to comment on this line; Shift-click to select multiple lines";
+            if (number) number.title = matches.length ? `${matches.length} unresolved comments` : "Click to select this line; Shift-click to select multiple lines";
         }
+        updateCommentButtons();
     }
     async function locate(thread) {
         activeId = thread.id;
@@ -137,7 +158,7 @@ export function createReviewUI({ request, getState, openAnchor, showError }) {
             }
             fragment.append(card);
         }
-        if (!threads.length) fragment.append(element("p", "review-help", "Select code on one side or click a line number (Shift-click for multiple lines), then add a comment. Comments are sent to this canvas's conversation."));
+        if (!threads.length) fragment.append(element("p", "review-help", "Hover over a line number and click + to comment. Selecting code also shows + beside the last selected line. Shift-click line numbers to select multiple lines. Comments are sent to this canvas's conversation."));
         $("review-list").replaceChildren(fragment);
         annotate();
     }
@@ -169,13 +190,20 @@ export function createReviewUI({ request, getState, openAnchor, showError }) {
         $("review-selection").textContent = `${selection.path} · ${location(selection)}`;
         navigation();
     }
-    function captureSelection() {
+    function clearSelection() {
+        if (!$("review-composer").hidden) return;
+        selection = undefined;
+        updateCommentButtons();
+    }
+    function captureSelection(event) {
+        if (event.target.closest(".number")) return;
         const chosen = window.getSelection();
-        if (!chosen?.rangeCount || chosen.isCollapsed) return;
+        if (!chosen?.rangeCount || chosen.isCollapsed) return clearSelection();
         const range = chosen.getRangeAt(0);
         const cellFor = (node) => (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement)?.closest(".code[data-source-side]");
         const start = cellFor(range.startContainer), end = cellFor(range.endContainer);
-        if (!start || !end || start.dataset.sourceSide !== end.dataset.sourceSide) return;
+        if (!start || !end || start.dataset.sourceSide !== end.dataset.sourceSide
+            || typeof getState().currentFile?.sources?.[start.dataset.sourceSide]?.text !== "string") return clearSelection();
         const column = (cell, container, offset) => {
             const prefix = document.createRange();
             prefix.selectNodeContents(cell.querySelector(".code-text"));
@@ -189,27 +217,39 @@ export function createReviewUI({ request, getState, openAnchor, showError }) {
     }
     $("diff").addEventListener("pointerup", captureSelection);
     $("diff").addEventListener("keyup", captureSelection);
-    function pickLine(event) {
-        const cell = event.target.closest(".number[data-source-side]");
-        if (!cell) return;
-        if (event.type === "keydown" && !["Enter", " "].includes(event.key)) return;
-        event.preventDefault();
+    function selectLine(cell, extend = false) {
         const side = cell.dataset.sourceSide, line = Number(cell.dataset.line);
         const state = getState();
         const source = state.currentFile?.sources?.[side]?.text;
         if (typeof source !== "string") return;
         const lines = source.replace(/\r\n/g, "\n").split("\n");
-        const from = event.shiftKey && firstLine?.path === state.currentFile.path && firstLine.side === side
+        const from = extend && firstLine?.path === state.currentFile.path && firstLine.side === side
             && firstLine.comparisonId === state.comparison.id ? firstLine.line : line;
         firstLine = { path: state.currentFile.path, side, line: from, comparisonId: state.comparison.id };
         capture(side, Math.min(from, line), Math.max(from, line), 0, lines[Math.max(from, line) - 1].length);
     }
+    function pickLine(event) {
+        if (event.target.closest(".line-comment")) return;
+        const cell = event.target.closest(".number[data-source-side]");
+        if (!cell) return;
+        if (event.type === "keydown" && !["Enter", " "].includes(event.key)) return;
+        event.preventDefault();
+        window.getSelection()?.removeAllRanges();
+        selectLine(cell, event.shiftKey);
+    }
     $("diff").addEventListener("click", pickLine);
     $("diff").addEventListener("keydown", pickLine);
-    $("add-comment").addEventListener("pointerdown", (event) => event.preventDefault());
-    $("add-comment").addEventListener("click", () => {
-        captureSelection();
-        if (!selection) return;
+    $("diff").addEventListener("pointerdown", (event) => {
+        if (event.target.closest(".line-comment")) event.preventDefault();
+    });
+    $("diff").addEventListener("click", (event) => {
+        const button = event.target.closest(".line-comment");
+        if (!button || button.disabled) return;
+        const number = button.parentElement;
+        const line = Number(number.dataset.line);
+        if (!selection || !currentSelection() || selection.side !== number.dataset.sourceSide
+            || line < selection.startLine || line > selection.endLine) selectLine(number, event.shiftKey);
+        if (!selection || !currentSelection()) return;
         dock();
         $("review-composer").hidden = false;
         $("review-body").focus();

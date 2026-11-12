@@ -118,7 +118,7 @@ aside { width: 260px; min-width: 160px; max-width: 55%; display: flex; flex-dire
 .hunk { margin-bottom: 18px; }
 .hunk-header { position: sticky; top: 0; z-index: 1; font: 11px/25px var(--font-mono, Consolas, monospace); padding: 0 12px; background: var(--selected); color: var(--blue); border-block: 1px solid var(--border); white-space: pre-wrap; overflow-wrap: anywhere; }
 .diff-table { width: 100%; table-layout: fixed; border-collapse: collapse; font: 12px/21px var(--font-mono, Consolas, monospace); tab-size: 4; }
-.diff-table .number { width: 48px; color: var(--muted); text-align: right; padding: 0 8px 0 4px; background: var(--surface); user-select: none; vertical-align: top; font-size: 11px; }
+.diff-table .number { width: 68px; color: var(--muted); text-align: right; padding: 0 8px 0 24px; background: var(--surface); user-select: none; vertical-align: top; font-size: 11px; position: relative; }
 .diff-table .sign { width: 18px; text-align: center; user-select: none; vertical-align: top; }
 .diff-table .code { padding: 0 8px; white-space: pre; overflow: hidden; vertical-align: top; }
 .diff-table .number:nth-child(3) { border-left: 1px solid var(--border); }
@@ -171,13 +171,17 @@ footer span:last-child { white-space: nowrap; }
 .review-message p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 5px 0; }
 .review-message.agent strong { color: var(--blue); }
 .review-warning, .review-help { font-size: 11px; color: var(--muted); }
-.diff-table .number[role=button] { cursor: pointer; }
+.diff-table .number[data-source-side] { cursor: pointer; }
+.line-comment { position: absolute; left: 3px; top: 1px; width: 18px; min-height: 18px; height: 18px; padding: 0; border-radius: 3px; font: 16px/16px var(--font-sans, "Segoe UI", sans-serif); background: var(--blue); color: var(--color-white, #fff); border-color: var(--blue); opacity: 0; pointer-events: none; }
+.line-comment:disabled { opacity: 0; }
+.number:hover > .line-comment:not(:disabled), .number:focus-within > .line-comment:not(:disabled), .number.selection-end > .line-comment:not(:disabled) { opacity: 1; pointer-events: auto; }
+.line-comment:hover:not(:disabled) { background: var(--blue); filter: brightness(1.1); }
 .diff-table .number.has-review { box-shadow: inset -4px 0 var(--blue); }
 .diff-table .code.review-highlight { outline: 2px solid var(--blue); outline-offset: -2px; }
 @media (max-width: 780px) {
   header { padding: 9px; } aside { width: 200px; min-width: 130px; }
   #summary, footer span:last-child { display: none; }
   .compare-row { gap: 6px; } .mode-field { flex: 1; }
-  .detail-toolbar { gap: 5px; } .diff-table .number { width: 36px; padding-right: 5px; }
+  .detail-toolbar { gap: 5px; } .diff-table .number { width: 60px; padding-right: 5px; }
   .view-controls { gap: 3px; } .file-stat { display: none; }
 }

@@ -6,7 +6,7 @@ GitHub Copilot 桌面应用的只读 Git 分支比较 Canvas，使用英文界�
 
 - 比较任意本地 Git refs：端点比较 `A B`、共同祖先比较 `A...B`，自动读取所属会话 worktree 与当前分支。
 - 文件筛选、增删统计、并排 / 统一 diff、全文并排 / 单栏、语法高亮、换行和跨文件改动导航。
-- 同一侧任意代码片段评论：拖选文字（含行内部分）或点击行号，Shift 点击可选多行。
+- 行号左侧的 `+` 评论入口在悬停行号或选中代码时显示；支持行内片段和 Shift 点击多行。
 - 评论发送给此 Canvas 所属主对话；主 Agent 处理后通过专用工具回复。用户可继续回复或 Resolve，已解决线程默认折叠。
 - 独立的评论前后跳转；评论固定到原始 Git blob，代码变化时标记过期而不是误定位。
 - 不切换分支、不修改被查看的工作区、不下载 Git 对象。缺少本地对象时明确提示跳过。
@@ -45,7 +45,7 @@ https://github.com/<owner>/<repo>/tree/main/extensions/git-changes
 
 ## 代码评审流程
 
-1. 在代码上选择范围，点击「Comment on selection」，填写意见并「Send to conversation」。
+1. 悬停行号并点击左侧的 `+`，或先选择代码范围再点击选区末行左侧的 `+`，填写意见并「Send to conversation」。
 2. 扩展使用 SDK `session.send` 排队到所属会话，保留现有权限、模式与审批流程。主 Agent 通过 `git_changes_review_read` 读取线程，通过 `git_changes_review_reply` 回帖；线程不自动解决。
 3. 用户继续「Send reply」或 Resolve。已解决线程折叠，可展开查看历史或 Reopen。评论导航只遍历未解决线程。
 

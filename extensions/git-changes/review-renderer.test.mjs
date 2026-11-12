@@ -43,6 +43,23 @@ try {
     await frame.locator(".change-anchor").first().waitFor();
     await frame.locator("#full-file").click();
     await frame.locator(".full-split").waitFor();
+    assert.equal(await frame.locator("#add-comment").count(), 0);
+    const lineNumber = (side, line) => frame.locator(`#diff .number[data-source-side="${side}"][data-line="${line}"]`);
+    const hoverLine = lineNumber("base", 2);
+    const hoverButton = hoverLine.locator(".line-comment");
+    await hoverLine.locator(".line-comment:not(:disabled)").waitFor();
+    assert.equal(await hoverButton.evaluate((button) => getComputedStyle(button).opacity), "0");
+    await hoverLine.hover();
+    assert.equal(await hoverButton.evaluate((button) => getComputedStyle(button).opacity), "1");
+    const gutter = await hoverLine.evaluate((number) => ({
+        buttonRight: number.querySelector(".line-comment").getBoundingClientRect().right,
+        numberLeft: number.querySelector(".line-number").getBoundingClientRect().left,
+    }));
+    assert(gutter.buttonRight <= gutter.numberLeft, "The comment button must sit to the left of the line number");
+    await hoverButton.click();
+    assert.match(await frame.locator("#review-selection").textContent(), /A · L2:1–L2:/);
+    await frame.locator("#review-cancel").click();
+    await frame.locator(".brand").hover();
     await frame.locator("#diff").evaluate((diff) => {
         const first = diff.querySelector('.code[data-source-side="target"][data-line="2"] .code-text');
         const last = diff.querySelector('.code[data-source-side="target"][data-line="3"] .code-text');
@@ -62,8 +79,10 @@ try {
         selection.addRange(range);
         diff.dispatchEvent(new Event("pointerup", { bubbles: true }));
     });
-    await frame.locator("#add-comment:not(:disabled)").waitFor();
-    await frame.locator("#add-comment").click();
+    const selectionButton = lineNumber("target", 3).locator(".line-comment");
+    assert.equal(await selectionButton.evaluate((button) => getComputedStyle(button).opacity), "1");
+    assert.equal(await lineNumber("base", 3).locator(".line-comment").evaluate((button) => getComputedStyle(button).opacity), "0");
+    await selectionButton.click();
     await frame.locator("#review-body").fill("Please review this range <img src=x>");
     await frame.locator("#review-submit").click();
     await frame.locator(".review-thread").waitFor();
@@ -93,22 +112,31 @@ try {
     await frame.locator(".review-thread > summary").click();
     await frame.getByRole("button", { name: "Reopen", exact: true }).click();
     await frame.getByRole("button", { name: "Resolve", exact: true }).waitFor();
-    await frame.locator('#diff .number[data-source-side="target"][data-line="1"]').click();
-    await frame.locator('#diff .number[data-source-side="target"][data-line="3"]').click({ modifiers: ["Shift"] });
-    await frame.locator("#add-comment").click();
+    await lineNumber("target", 1).locator(".line-number").click();
+    await lineNumber("target", 3).locator(".line-number").click({ modifiers: ["Shift"] });
+    await lineNumber("target", 3).locator(".line-comment").click();
     assert.match(await frame.locator("#review-selection").textContent(), /L1:1–L3:/);
     await frame.locator("#review-cancel").click();
     await frame.locator("#full-file").click();
     await frame.locator("#view").selectOption("unified");
-    await frame.locator('#diff .number[data-source-side="target"][data-line="2"]').click();
-    await frame.locator("#add-comment").click();
+    await lineNumber("base", 2).locator(".line-comment").focus();
+    assert.equal(await lineNumber("base", 2).locator(".line-comment").evaluate((button) => getComputedStyle(button).opacity), "1");
+    await lineNumber("base", 2).locator(".line-comment").press("Enter");
+    assert.match(await frame.locator("#review-selection").textContent(), /A · L2:1–L2:/);
+    await frame.locator("#review-cancel").click();
+    await lineNumber("target", 2).locator(".line-comment").focus();
+    await lineNumber("target", 2).locator(".line-comment").press("Space");
     assert.match(await frame.locator("#review-selection").textContent(), /L2:1–L2:/);
     await frame.locator("#review-cancel").click();
     await frame.locator("#view").selectOption("split");
     await frame.locator("#full-file").click();
+    await lineNumber("target", 1).locator(".line-number").click();
     await frame.locator("[data-path='second.cs']").click();
-    await frame.locator('#diff .number[data-source-side="target"][data-line="1"]').click();
-    await frame.locator("#add-comment").click();
+    await lineNumber("target", 1).waitFor();
+    assert.equal(await frame.locator(".number.selection-end").count(), 0, "A selection must not follow the line number into a different file");
+    await lineNumber("target", 1).hover();
+    await lineNumber("target", 1).locator(".line-comment").click();
+    assert.match(await frame.locator("#review-selection").textContent(), /^second\.cs · B · L1:1–L1:/);
     await frame.locator("#review-body").fill("Second file review");
     await frame.locator("#review-submit").click();
     for (let i = 0; i < 50 && store.list().length < 2; i++) await page.waitForTimeout(20);
@@ -132,7 +160,7 @@ try {
     assert.equal(store.read(first.id).anchor.quote, first.anchor.quote);
     assert.doesNotMatch(await frame.locator("body").innerText(), /\p{Script=Han}/u);
     assert.deepEqual(errors, []);
-    console.log("PASS: range selection, dispatch, agent replies, user follow-up, resolve/collapse, persistence, comment navigation and stale anchors.");
+    console.log("PASS: gutter hover/selection controls, keyboard commenting, range preservation, dispatch, replies, persistence and stale anchors.");
 } finally {
     await browser?.close();
     if (host) await new Promise((resolve) => host.close(resolve));
