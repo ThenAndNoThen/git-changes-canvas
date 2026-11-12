@@ -17,23 +17,25 @@ Requires Git, Node.js (version 22 or later recommended), and a GitHub Copilot de
 
 ### Install from GitHub (recommended for sharing)
 
-Once the repository is on GitHub, share the **`extensions/git-changes` folder URL**, for example:
+Share the **[`extensions/git-changes` folder URL](https://github.com/ThenAndNoThen/git-changes-canvas/tree/main/extensions/git-changes)**, not the repository root:
 
 ```text
-https://github.com/<owner>/<repo>/tree/main/extensions/git-changes
+https://github.com/ThenAndNoThen/git-changes-canvas/tree/main/extensions/git-changes
 ```
 
 The recipient can ask Copilot:
 
 ```text
-Install this canvas extension at user scope: <GitHub folder URL above>
+Install this canvas extension at user scope: https://github.com/ThenAndNoThen/git-changes-canvas/tree/main/extensions/git-changes
 ```
 
 The app's `install_extension` tool supports this GitHub folder URL format and reloads extensions after installation. A user-scoped installation is available to sessions on the same machine; other running sessions may need to reload their extensions. Then select Git Changes from the right-panel canvas menu, or ask the agent to open Git Changes in the target repository's session.
 
+The recipient must have access to the repository; a folder URL does not grant access to a private repository.
+
 ### Local installation
 
-Copy the contents of `extensions\git-changes`, including the `vendor` subdirectory, to `$COPILOT_HOME\extensions\git-changes`. When `COPILOT_HOME` is unset, this is usually `~\.copilot\extensions\git-changes`. For an existing installation, preserve its `artifacts` data directory and do not overwrite it with older data. Then reload extensions in the owning session.
+Copy the contents of `extensions\git-changes`, including the `vendor` subdirectory, to the `extensions\git-changes` directory under `COPILOT_HOME` (`$env:COPILOT_HOME` in PowerShell). When `COPILOT_HOME` is unset, this is usually `~\.copilot\extensions\git-changes`. For an existing installation, preserve its `artifacts` data directory and do not overwrite it with older data. Then reload extensions in the owning session.
 
 **No `npm install` is needed at runtime.** Syntax-highlighting assets are bundled locally, and the Copilot runtime provides `@github/copilot-sdk`. The root npm dependencies are only for development and testing.
 
@@ -65,7 +67,7 @@ npm test
 npm run test:browser
 ```
 
-Browser tests use an installed Microsoft Edge in headless mode and exercise the canvas inside a `sandbox="allow-scripts"` iframe. Tests create and clean up their own temporary Git repositories. Review tests mock the conversation send function and never send test messages to a real session.
+Run these commands from the repository root. Browser tests use an installed Microsoft Edge in headless mode and exercise the canvas inside a `sandbox="allow-scripts"` iframe. Tests create and clean up disposable fixtures: Git and browser tests use the current working directory, while review unit tests use the OS temporary directory. Review tests mock the conversation send function and never send test messages to a real session.
 
 To rebuild the syntax-highlighting bundle:
 
@@ -75,15 +77,6 @@ npm run build:highlight
 
 Preserve `extensions\git-changes\vendor\highlight.LICENSE` after rebuilding. See the [extension documentation](extensions/git-changes/README.md) for comparison semantics, limitations, and security details.
 
-## Publishing
-
-The default branch is `main`. When publishing a new copy without a configured remote, review the source, choose a license for users, create a GitHub repository, and commit and push:
-
-```powershell
-git add .
-git commit -m "Add Git Changes canvas"
-git remote add origin https://github.com/<owner>/<repo>.git
-git push -u origin main
-```
+## Licensing
 
 No project-wide open-source license has been selected. Choose one before distributing the project. The third-party BSD-3-Clause license for highlight.js is included with its assets.
