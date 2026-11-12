@@ -1,0 +1,16 @@
+{
+  "name": "git-changes-canvas",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test extensions/git-changes/git.test.mjs extensions/git-changes/reviews.test.mjs",
+    "test:browser": "node extensions/git-changes/renderer.test.mjs && node extensions/git-changes/review-renderer.test.mjs",
+    "build:highlight": "esbuild node_modules/highlight.js/lib/common.js --bundle --format=esm --platform=browser --minify --outfile=extensions/git-changes/vendor/highlight.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "highlight.js": "11.11.1",
+    "playwright": "1.56.1"
+  }
+}

@@ -1,0 +1,11 @@
+node_modules/
+artifacts/
+**/artifacts/
+**/git-changes-reviews.json
+**/preferences.json
+git-changes-fixture-*/
+sandbox-test-*/
+review-browser-*/
+*.tmp
+*.log
+.DS_Store
