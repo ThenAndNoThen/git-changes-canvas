@@ -55,6 +55,10 @@ Comments refer to historical commits, which may differ from the current files on
 
 ## Development and validation
 
+The repository does not set an npm registry. Developers without a custom registry use npm's public default; developers using an organization registry keep their existing user-level or global configuration. Do not commit registry URLs or authentication credentials.
+
+The project `.npmrc` sets `omit-lockfile-registry-resolved=true`, so `package-lock.json` retains pinned versions and integrity hashes without registry download URLs. `npm ci` resolves downloads through your configured registry, which must provide the pinned versions with matching integrity hashes. This can add metadata requests.
+
 ```powershell
 npm ci --ignore-scripts
 npm test
