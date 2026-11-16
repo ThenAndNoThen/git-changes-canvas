@@ -1,19 +1,22 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { isAbsolute, normalize } from "node:path";
+import { delimiter, isAbsolute, join, normalize } from "node:path";
 import { createHash } from "node:crypto";
+import { copyFile, mkdir, mkdtemp, rm, stat, utimes } from "node:fs/promises";
+import { tmpdir } from "node:os";
 
 const execute = promisify(execFile);
 const MAX_OUTPUT = 24 * 1024 * 1024;
+const snapshots = new WeakMap();
 
-export async function git(repo, args, maxBuffer = MAX_OUTPUT, input = "") {
+export async function git(repo, args, maxBuffer = MAX_OUTPUT, input = "", environment = {}) {
     try {
         let inputError;
         const operation = execute("git", [
-            "--no-pager", "--literal-pathspecs", "-c", "core.quotepath=false", ...args,
+            "--no-pager", "--literal-pathspecs", "-c", "core.quotepath=false", "-c", "core.fsmonitor=false", ...args,
         ], {
             cwd: repo, windowsHide: true, encoding: "utf8", maxBuffer, timeout: 60000,
-            env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_NO_LAZY_FETCH: "1" },
+            env: { ...process.env, ...environment, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_NO_LAZY_FETCH: "1" },
         });
         operation.child.stdin.on("error", (error) => {
             if (error.code !== "EPIPE" && error.code !== "EOF") {
@@ -33,6 +36,51 @@ export async function git(repo, args, maxBuffer = MAX_OUTPUT, input = "") {
         const failure = new Error((error.stderr || error.message).trim());
         failure.exitCode = error.code;
         throw failure;
+    }
+}
+
+async function workingTreeSnapshot(repo) {
+    const directory = await mkdtemp(join(tmpdir(), "git-changes-snapshot-"));
+    try {
+        const [index, objects] = await Promise.all(["index", "objects"].map(async (path) =>
+            (await git(repo, ["rev-parse", "--path-format=absolute", "--git-path", path])).trim()));
+        const environment = {
+            GIT_INDEX_FILE: join(directory, "index"),
+            GIT_OBJECT_DIRECTORY: join(directory, "objects"),
+            GIT_ALTERNATE_OBJECT_DIRECTORIES: [JSON.stringify(objects), process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES].filter(Boolean).join(delimiter),
+        };
+        await mkdir(environment.GIT_OBJECT_DIRECTORY);
+        try {
+            const metadata = await stat(index);
+            await copyFile(index, environment.GIT_INDEX_FILE);
+            // A newer copied-index timestamp would hide same-size, racy edits.
+            await utimes(environment.GIT_INDEX_FILE, metadata.atime, metadata.mtime);
+        }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+        // Keep Git's built-in line-ending handling, but never run repository clean filters.
+        let filterKeys = "";
+        try { filterKeys = await git(repo, ["config", "--name-only", "--get-regexp", "^filter\\..*\\.(clean|process|required)$"]); }
+        catch (error) { if (error.exitCode !== 1) throw error; }
+        const filterOptions = [...new Set(filterKeys.trim().split(/\r?\n/).filter(Boolean).map((key) => key.replace(/\.[^.]+$/, "")))]
+            .flatMap((filter) => ["-c", `${filter}.clean=`, "-c", `${filter}.process=`, "-c", `${filter}.required=false`]);
+        const run = (args, input = "") => git(repo, [...filterOptions, ...args], MAX_OUTPUT, input, environment);
+        // Only the copied index and temporary object directory can be written.
+        await run(["update-index", "--no-split-index"]);
+        await run(["add", "--all", "--", "."]);
+        const tree = (await run(["write-tree"])).trim();
+        const emptyTree = (await run(["hash-object", "-t", "tree", "-w", "--stdin"])).trim();
+        return { directory, environment, tree, emptyTree };
+    } catch (error) {
+        await rm(directory, { recursive: true, force: true });
+        throw error;
+    }
+}
+
+export async function disposeComparison(comparison) {
+    const snapshot = snapshots.get(comparison);
+    if (snapshot) {
+        await rm(snapshot.directory, { recursive: true, force: true });
+        snapshots.delete(comparison);
     }
 }
 
@@ -104,9 +152,9 @@ export function parseFiles(names, stats) {
     return files;
 }
 
-async function localChanges(repo, from, right) {
+async function localChanges(repo, from, right, environment) {
     // Raw, no-renames diff reads trees and object IDs, not missing file blobs.
-    const raw = await git(repo, ["diff", "--raw", "--no-abbrev", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "-z", from, right, "--"]);
+    const raw = await git(repo, ["diff", "--raw", "--no-abbrev", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "-z", from, right, "--"], MAX_OUTPUT, "", environment);
     const fields = raw.split("\0");
     const changes = [];
     for (let i = 0; i < fields.length && fields[i]; i += 2) {
@@ -119,7 +167,7 @@ async function localChanges(repo, from, right) {
     const ids = [...new Set(changes.flatMap((change) => change.objects.filter((object) => object.mode !== "160000" && !/^0+$/.test(object.id)).map((object) => object.id)))];
     const missing = new Set();
     if (ids.length) {
-        const checks = await git(repo, ["cat-file", "--batch-check=%(objectname) %(objecttype)"], MAX_OUTPUT, ids.join("\n") + "\n");
+        const checks = await git(repo, ["cat-file", "--batch-check=%(objectname) %(objecttype)"], MAX_OUTPUT, ids.join("\n") + "\n", environment);
         for (const line of checks.trim().split(/\r?\n/)) {
             const [id, type] = line.split(" ");
             if (type === "missing") missing.add(id);
@@ -139,10 +187,33 @@ async function localChanges(repo, from, right) {
 export async function compare(input) {
     const mode = input.mode ?? "merge-base";
     if (!["endpoints", "merge-base"].includes(mode)) throw new Error("Unknown comparison mode.");
+    if (input.includeUncommitted !== undefined && typeof input.includeUncommitted !== "boolean") throw new Error("Invalid uncommitted changes option.");
     const info = await repository(input.repo);
-    const [left, right] = await Promise.all([commit(info.repo, input.base), commit(info.repo, input.target)]);
+    const includeUncommitted = input.includeUncommitted ?? true;
+    const isUnborn = (ref) => includeUncommitted && info.unborn && [info.head, "HEAD"].includes(ref);
+    const [left, right, head] = await Promise.all([
+        isUnborn(input.base) ? null : commit(info.repo, input.base),
+        isUnborn(input.target) ? null : commit(info.repo, input.target),
+        info.unborn ? null : commit(info.repo, "HEAD"),
+    ]);
+    const snapshot = includeUncommitted && right === head ? await workingTreeSnapshot(info.repo) : null;
+    try {
+        if (snapshot && !info.unborn && await commit(info.repo, "HEAD") !== head) throw new Error("HEAD changed while taking the working-tree snapshot. Refresh the comparison.");
+        const result = await compareTrees(input, info, mode, left, right, snapshot);
+        if (snapshot) snapshots.set(result, snapshot);
+        return result;
+    } catch (error) {
+        if (snapshot) await rm(snapshot.directory, { recursive: true, force: true });
+        throw error;
+    }
+}
+
+async function compareTrees(input, info, mode, left, right, snapshot) {
+    const environment = snapshot?.environment;
+    const to = snapshot?.tree ?? right;
     let from = left;
-    if (mode === "merge-base") {
+    if (mode === "merge-base" && !!left !== !!right) throw new Error("These refs have no common ancestor. Use endpoint mode.");
+    if (mode === "merge-base" && left && right) {
         let output;
         try {
             output = await git(info.repo, ["merge-base", "--all", left, right]);
@@ -156,7 +227,9 @@ export async function compare(input) {
         }
         from = ancestors[0];
     }
-    const { available, skipped } = await localChanges(info.repo, from, right);
+    from ??= snapshot?.emptyTree;
+    if (!from || !to) throw new Error("No commits to compare. Enable uncommitted changes for the current branch.");
+    const { available, skipped } = await localChanges(info.repo, from, to, environment);
     const files = [];
     // Bound path arguments below Windows' command-line limit.
     for (let i = 0; i < available.length;) {
@@ -167,16 +240,18 @@ export async function compare(input) {
             batch.push(change);
             length += change.path.length * 2 + 4;
         } while (i < available.length && length + available[i].path.length * 2 + 4 < 16000);
-        const stats = await git(info.repo, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--ignore-submodules=none", "--numstat", "-z", from, right, "--", ...batch.map((change) => change.path)]);
+        const stats = await git(info.repo, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--ignore-submodules=none", "--numstat", "-z", from, to, "--", ...batch.map((change) => change.path)], MAX_OUTPUT, "", environment);
         files.push(...parseFiles(batch.map((change) => `${change.status}\0${change.path}\0`).join(""), stats).map((file, index) => ({
             ...file, baseObject: batch[index].objects[0], targetObject: batch[index].objects[1],
         })));
     }
     return {
-        id: createHash("sha256").update(JSON.stringify([info.repo, from, right, mode, left, files.map((file) => file.path), skipped])).digest("hex"),
+        id: createHash("sha256").update(JSON.stringify([info.repo, from, right, to, !!snapshot, mode, left, files.map((file) => file.path), skipped])).digest("hex"),
         repo: info.repo, base: input.base, target: input.target, mode,
-        left, from, right, files, fileCount: files.length,
-        scope: "local-objects", skipped,
+        left, from, right, to, files, fileCount: files.length,
+        includeUncommitted: input.includeUncommitted ?? true,
+        includesUncommitted: !!snapshot,
+        scope: snapshot ? "working-tree" : "local-objects", skipped,
         additions: files.reduce((total, file) => total + (file.additions ?? 0), 0),
         deletions: files.reduce((total, file) => total + (file.deletions ?? 0), 0),
     };
@@ -220,8 +295,8 @@ export async function fileDiff(comparison, path) {
     const patch = await git(comparison.repo, [
         "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames",
         "--ignore-submodules=none", "--submodule=short", "--unified=3",
-        comparison.from, comparison.right, "--", ...new Set([entry.oldPath, entry.path].filter(Boolean)),
-    ]);
+        comparison.from, comparison.to, "--", ...new Set([entry.oldPath, entry.path].filter(Boolean)),
+    ], MAX_OUTPUT, "", snapshots.get(comparison)?.environment);
     return { ...entry, comparisonId: comparison.id, ...parsePatch(patch) };
 }
 
@@ -234,13 +309,14 @@ export async function fileSources(comparison, path) {
     }
     async function read(object, revision) {
         if (/^0+$/.test(object.id)) return null;
-        const size = Number((await git(comparison.repo, ["cat-file", "-s", object.id])).trim());
+        const environment = snapshots.get(comparison)?.environment;
+        const size = Number((await git(comparison.repo, ["cat-file", "-s", object.id], MAX_OUTPUT, "", environment)).trim());
         if (size > MAX_OUTPUT) return { revision, text: null, unavailableReason: "This file exceeds 24 MiB and cannot be loaded in full in the panel." };
-        const text = await git(comparison.repo, ["cat-file", "blob", object.id]);
+        const text = await git(comparison.repo, ["cat-file", "blob", object.id], MAX_OUTPUT, "", environment);
         return { revision, text };
     }
     const [base, target] = await Promise.all([
-        read(entry.baseObject, comparison.from), read(entry.targetObject, comparison.right),
+        read(entry.baseObject, comparison.from), read(entry.targetObject, comparison.includesUncommitted ? "Working tree" : comparison.right),
     ]);
     return { base, target, unavailableReason: null };
 }

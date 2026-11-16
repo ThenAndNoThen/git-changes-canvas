@@ -17,6 +17,8 @@ let persistTimer;
 let coloring = { left: null, right: null };
 
 const isFullFile = () => $("full-file").getAttribute("aria-pressed") === "true";
+const baseLabel = () => comparison.left === null ? "Empty tree" : comparison.mode === "merge-base" ? "Common ancestor" : comparison.base;
+const targetRevision = () => comparison.includesUncommitted ? "Working tree" : comparison.right.slice(0, 10);
 
 function setFullFile(value) {
     $("full-file").setAttribute("aria-pressed", String(value));
@@ -181,8 +183,8 @@ function renderDiff() {
     $("right-label").hidden = false;
     const unified = $("view").value === "unified";
     $("pane-labels").hidden = unified;
-    $("left-label").textContent = `${comparison.mode === "merge-base" ? "Common ancestor" : comparison.base} · ${comparison.from.slice(0, 10)}`;
-    $("right-label").textContent = `${comparison.target} · ${comparison.right.slice(0, 10)}`;
+    $("left-label").textContent = `${baseLabel()} · ${comparison.from.slice(0, 10)}`;
+    $("right-label").textContent = `${comparison.target} · ${targetRevision()}`;
     const fragment = document.createDocumentFragment();
     const metadata = currentFile.metadata.filter((line) => !line.startsWith("diff --git") && !line.startsWith("index ") && !line.startsWith("--- ") && !line.startsWith("+++ "));
     if (metadata.length) fragment.append(node("div", "metadata", metadata.join("\n")));
@@ -244,7 +246,7 @@ function renderFullFile() {
     $("pane-labels").hidden = false;
     $("pane-labels").classList.add("full");
     $("right-label").hidden = true;
-    $("left-label").textContent = `${label} · ${source.revision.slice(0, 10)} · Full file`;
+    $("left-label").textContent = `${label} · ${source.revision === "Working tree" ? source.revision : source.revision.slice(0, 10)} · Full file`;
     const table = node("table", "diff-table full-table");
     const colgroup = node("colgroup");
     colgroup.append(node("col", "number"), node("col"));
@@ -300,8 +302,8 @@ function renderFullSplit(base, target) {
     $("pane-labels").hidden = false;
     $("pane-labels").classList.remove("full");
     $("right-label").hidden = false;
-    $("left-label").textContent = `${comparison.mode === "merge-base" ? "Common ancestor" : comparison.base} · ${comparison.from.slice(0, 10)} · ${base ? "Full file" : "File does not exist"}`;
-    $("right-label").textContent = `${comparison.target} · ${comparison.right.slice(0, 10)} · ${target ? "Full file" : "File deleted"}`;
+    $("left-label").textContent = `${baseLabel()} · ${comparison.from.slice(0, 10)} · ${base ? "Full file" : "File does not exist"}`;
+    $("right-label").textContent = `${comparison.target} · ${targetRevision()} · ${target ? "Full file" : "File deleted"}`;
     const table = node("table", "diff-table full-table full-split");
     const colgroup = node("colgroup");
     for (const type of ["number", "", "number", ""]) colgroup.append(node("col", type));
@@ -415,7 +417,9 @@ async function applyComparison(value) {
     const changed = comparison?.id !== value.id;
     comparison = value;
     $("summary").textContent = `${value.fileCount} files  ·  +${value.additions}  −${value.deletions}`;
-    $("scope-note").textContent = `Local Git objects only · Includes files not checked out, added and deleted files · Skipped ${value.skipped.length} files with missing history (no downloads)`;
+    const scope = value.includesUncommitted ? "Includes staged, unstaged and untracked changes · Frozen working-tree snapshot"
+        : value.includeUncommitted ? "Committed changes only · Target B is not current HEAD" : "Committed changes only";
+    $("scope-note").textContent = `${scope} · Skipped ${value.skipped.length} files with missing history (no downloads)`;
     $("scope-note").title = value.skipped.slice(0, 30).map((file) => file.path).join("\n");
     renderFiles();
     const path = visibleFiles.find((file) => file.path === selectedPath)?.path ?? visibleFiles[0]?.path;
@@ -430,6 +434,7 @@ async function applyComparison(value) {
             ? `${value.skipped.length} files were skipped because required local history is missing. Nothing was downloaded; skipped files may still contain changes.`
             : value.mode === "merge-base" && value.from === value.right && value.left !== value.right
             ? "Target B has no changes since divergence. A...B only shows B's changes; swap A and B to see changes unique to A."
+            : value.includesUncommitted ? "No changes in this comparison, including the current working tree."
             : "No committed changes in this comparison. Uncommitted changes are not included.";
         empty(value.skipped.length ? "Required local objects are missing" : "No changes to display", $("filter").value ? "Clear the file filter to see all changes." : explanation);
         $("status").textContent = "Comparison complete";
@@ -454,6 +459,7 @@ async function loadRepository(restore = true) {
     if (restore || !$("target").value) $("target").value = info.head;
     if (restore) {
         $("mode").value = "merge-base";
+        $("include-uncommitted").checked = info.saved.includeUncommitted ?? true;
         $("view").value = info.saved.view || "split";
         $("wrap").setAttribute("aria-pressed", String(info.saved.wrap ?? false));
         setFullFile(info.saved.fullFile ?? false);
@@ -462,7 +468,7 @@ async function loadRepository(restore = true) {
     }
     updateModeHint();
     $("status").textContent = info.baseSource === "head"
-        ? "No remote default branch or upstream configured; using HEAD as the base. Only committed changes are compared."
+        ? "No remote default branch or upstream configured; using HEAD as the base."
         : `${info.refs.length} local / remote branches (no automatic fetch)`;
     return info;
 }
@@ -479,6 +485,7 @@ async function runCompare() {
         const result = await request("compare", {
             repo: $("repo").value.trim(), base: $("base").value.trim(),
             target: $("target").value.trim(), mode: $("mode").value,
+            includeUncommitted: $("include-uncommitted").checked,
         });
         await applyComparison(result);
         const option = node("option"); option.value = result.repo;
@@ -504,7 +511,7 @@ $("compare-form").addEventListener("keydown", (event) => {
 });
 $("load-repo").addEventListener("click", () => { clearError(); loadRepository().catch(showError); });
 $("repo").addEventListener("change", () => { clearError(); loadRepository().catch(showError); });
-for (const id of ["base", "target", "mode"]) $(id).addEventListener("input", () => {
+for (const id of ["base", "target", "mode", "include-uncommitted"]) $(id).addEventListener("input", () => {
     updateModeHint();
     $("status").textContent = "Parameters changed. Click Compare / Refresh to apply; the previous result is still displayed.";
 });
@@ -620,13 +627,14 @@ async function boot() {
     const info = await loadRepository();
     if (!info) return;
     for (const key of ["base", "target", "mode", "view"]) if (settings[key]) $(key).value = settings[key];
+    $("include-uncommitted").checked = settings.includeUncommitted ?? true;
     $("wrap").setAttribute("aria-pressed", String(settings.wrap ?? false));
     setFullFile(settings.fullFile ?? false);
     $("diff").classList.toggle("wrap", settings.wrap ?? false);
     selectedPath = settings.selectedPath || "";
     updateModeHint();
     if (state.comparison) await applyComparison(state.comparison);
-    else if (info.unborn && [settings.base, settings.target].some((ref) => ref === "HEAD" || ref === info.head)) {
+    else if (!settings.includeUncommitted && info.unborn && [settings.base, settings.target].some((ref) => ref === "HEAD" || ref === info.head)) {
         $("filename").textContent = "No commits on this branch";
         $("status").textContent = "No commits to compare.";
         empty("No commits on this branch", "Create the first commit and click Compare / Refresh, or select other refs with existing commits.");
@@ -641,6 +649,7 @@ events.onmessage = async () => {
         const state = await request("state");
         if (state.comparison && state.comparison.id !== comparison?.id) {
             for (const key of ["repo", "base", "target", "mode"]) $(key).value = state.settings[key];
+            $("include-uncommitted").checked = state.settings.includeUncommitted ?? true;
             updateModeHint();
             await applyComparison(state.comparison);
         }

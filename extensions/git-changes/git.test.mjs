@@ -1,9 +1,9 @@
 import { before, after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, rename, rm, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, rename, rm, mkdir, utimes } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { compare, fileDiff, fileSources, git, parseFiles, parsePatch, repository } from "./git.mjs";
+import { compare as compareLocal, disposeComparison, fileDiff, fileSources, git, parseFiles, parsePatch, repository } from "./git.mjs";
 import { createPanel, initialSettings } from "./server.mjs";
 import { createReviewStore } from "./reviews.mjs";
 import { fullFileChanges, fullFileSections, groups, splitRows, wordRange } from "./diff-model.mjs";
@@ -14,6 +14,12 @@ let panel;
 let baseCommit;
 let featureCommit;
 let result;
+const comparisons = [];
+async function compare(input) {
+    const result = await compareLocal({ includeUncommitted: false, ...input });
+    comparisons.push(result);
+    return result;
+}
 
 before(async () => {
     repo = await mkdtemp(join(process.cwd(), "git-changes-fixture-"));
@@ -55,11 +61,126 @@ before(async () => {
 
 after(async () => {
     await panel?.close();
+    await Promise.all(comparisons.map(disposeComparison));
     if (repo) {
         assert.equal(await git(repo, ["status", "--porcelain=v1"]), beforeStatus);
         if (process.env.GIT_CHANGES_KEEP_FIXTURE === "1") console.error(`FIXTURE=${repo}`);
         else await rm(repo, { recursive: true, force: true });
     }
+});
+
+test("HEAD includes a frozen staged, unstaged and untracked snapshot without changing the repository", async () => {
+    const root = await mkdtemp(join(process.cwd(), "git-changes-working-"));
+    try {
+        await git(root, ["init", "-b", "main"]);
+        await git(root, ["config", "user.name", "Canvas fixture"]);
+        await git(root, ["config", "user.email", "fixture@example.invalid"]);
+        await git(root, ["config", "core.autocrlf", "true"]);
+        await writeFile(join(root, ".gitignore"), "*.ignored\n");
+        for (const name of ["mixed.txt", "staged.txt", "deleted.txt", "cancelled.txt"]) await writeFile(join(root, name), "original\r\n");
+        await git(root, ["add", "."]);
+        await git(root, ["commit", "-m", "base"]);
+        await git(root, ["branch", "historical"]);
+        await writeFile(join(root, "committed.txt"), "branch change\r\n");
+        await git(root, ["add", "."]);
+        await git(root, ["commit", "-m", "branch"]);
+        await writeFile(join(root, "mixed.txt"), "staged\r\n");
+        await writeFile(join(root, "staged.txt"), "staged only\r\n");
+        await writeFile(join(root, "kept.ignored"), "explicitly staged\r\n");
+        await writeFile(join(root, "cancelled.txt"), "staged but reverted on disk\r\n");
+        await git(root, ["add", "--force", "mixed.txt", "staged.txt", "kept.ignored", "cancelled.txt"]);
+        await git(root, ["update-index", "--split-index"]);
+        await writeFile(join(root, "mixed.txt"), "working\r\n");
+        await writeFile(join(root, "cancelled.txt"), "original\r\n");
+        await rm(join(root, "deleted.txt"));
+        await writeFile(join(root, "new [1].txt"), "untracked\r\n");
+        await writeFile(join(root, "empty.txt"), "");
+        await writeFile(join(root, "binary.bin"), Buffer.from([0, 1, 2]));
+        await writeFile(join(root, "skip.ignored"), "ignored\r\n");
+        const indexBefore = await readFile(join(root, ".git", "index"));
+        const objectsBefore = await git(root, ["count-objects", "-v"]);
+        const statusBefore = await git(root, ["status", "--porcelain=v1"]);
+        const refsBefore = await git(root, ["show-ref"]);
+        const snapshot = await compareLocal({ repo: root, base: "historical", target: "HEAD" });
+        comparisons.push(snapshot);
+        assert.equal(snapshot.includesUncommitted, true);
+        assert.deepEqual(snapshot.files.map((file) => file.path), ["binary.bin", "committed.txt", "deleted.txt", "empty.txt", "kept.ignored", "mixed.txt", "new [1].txt", "staged.txt"]);
+        assert.equal(snapshot.files.find((file) => file.path === "binary.bin").binary, true);
+        assert.equal(snapshot.files.find((file) => file.path === "deleted.txt").status, "D");
+        assert.equal((await fileSources(snapshot, "mixed.txt")).target.text, "working\n");
+        assert.equal((await fileSources(snapshot, "staged.txt")).target.text, "staged only\n");
+        assert.equal((await fileSources(snapshot, "kept.ignored")).target.text, "explicitly staged\n");
+        const added = await fileDiff(snapshot, "new [1].txt");
+        assert.deepEqual(added.hunks[0].lines.filter((line) => line.type === "add").map((line) => line.text), ["untracked"]);
+        assert.equal(added.additions, 1);
+        assert.equal((await fileSources(snapshot, "deleted.txt")).target, null);
+        assert.deepEqual(await readFile(join(root, ".git", "index")), indexBefore);
+        assert.equal(await git(root, ["count-objects", "-v"]), objectsBefore);
+        assert.equal(await git(root, ["status", "--porcelain=v1"]), statusBefore);
+        assert.equal(await git(root, ["show-ref"]), refsBefore);
+        await writeFile(join(root, "mixed.txt"), "later edit\r\n");
+        assert.equal((await fileSources(snapshot, "mixed.txt")).target.text, "working\n");
+        assert((await fileDiff(snapshot, "mixed.txt")).hunks[0].lines.some((line) => line.text === "working"));
+        const refreshed = await compare({ repo: root, base: "historical", target: "HEAD", includeUncommitted: true });
+        assert.notEqual(refreshed.id, snapshot.id);
+        assert.notEqual(refreshed.files.find((file) => file.path === "mixed.txt").targetObject.id, snapshot.files.find((file) => file.path === "mixed.txt").targetObject.id);
+        assert.equal((await fileSources(refreshed, "mixed.txt")).target.text, "later edit\n");
+        const historical = await compare({ repo: root, base: "historical", target: "historical", includeUncommitted: true });
+        assert.equal(historical.includesUncommitted, false);
+        assert.equal(historical.fileCount, 0);
+        const committed = await compare({ repo: root, base: "historical", target: "HEAD" });
+        assert.deepEqual(committed.files.map((file) => file.path), ["committed.txt"]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("working-tree snapshots preserve sparse files and disable repository clean/process filters", async () => {
+    const root = await mkdtemp(join(process.cwd(), "git-changes-sparse-"));
+    try {
+        await git(root, ["init", "-b", "main"]);
+        await git(root, ["config", "user.name", "Canvas fixture"]);
+        await git(root, ["config", "user.email", "fixture@example.invalid"]);
+        await mkdir(join(root, "included"));
+        await mkdir(join(root, "excluded"));
+        await writeFile(join(root, "included", "text.txt"), "base\n");
+        await writeFile(join(root, "excluded", "text.txt"), "not checked out\n");
+        await writeFile(join(root, ".gitattributes"), "included/text.txt filter=forbidden\n");
+        await git(root, ["add", "."]);
+        await git(root, ["commit", "-m", "base"]);
+        await git(root, ["sparse-checkout", "init", "--cone"]);
+        await git(root, ["sparse-checkout", "set", "included"]);
+        await git(root, ["config", "filter.forbidden.clean", "exit 1"]);
+        await git(root, ["config", "filter.forbidden.process", "exit 1"]);
+        await git(root, ["config", "filter.forbidden.required", "true"]);
+        await writeFile(join(root, "included", "text.txt"), "changed\n");
+        const snapshot = await compare({ repo: root, base: "HEAD", target: "HEAD", includeUncommitted: true });
+        assert.deepEqual(snapshot.files.map((file) => file.path), ["included/text.txt"]);
+        assert.equal((await fileSources(snapshot, "included/text.txt")).target.text, "changed\n");
+        assert.match(await git(root, ["ls-files", "-v", "excluded/text.txt"]), /^S /);
+    } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("snapshotting preserves Git's racy-index detection for same-size edits", async () => {
+    const root = await mkdtemp(join(process.cwd(), "git-changes-racy-"));
+    try {
+        await git(root, ["init", "-b", "main"]);
+        await git(root, ["config", "user.name", "Canvas fixture"]);
+        await git(root, ["config", "user.email", "fixture@example.invalid"]);
+        await git(root, ["config", "core.autocrlf", "false"]);
+        await git(root, ["config", "core.trustctime", "false"]);
+        await git(root, ["config", "core.checkStat", "minimal"]);
+        const file = join(root, "racy.txt");
+        const timestamp = new Date(Date.now() - 10000);
+        await writeFile(file, "before\n");
+        await utimes(file, timestamp, timestamp);
+        await git(root, ["add", "."]);
+        await git(root, ["commit", "-m", "base"]);
+        await writeFile(file, "after!\n");
+        await utimes(file, timestamp, timestamp);
+        await utimes(join(root, ".git", "index"), timestamp, timestamp);
+        const snapshot = await compare({ repo: root, base: "HEAD", target: "HEAD", includeUncommitted: true });
+        assert.deepEqual(snapshot.files.map((file) => file.path), ["racy.txt"]);
+        assert.equal((await fileSources(snapshot, "racy.txt")).target.text, "after!\n");
+    } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("A...B excludes A-only changes while A B includes them", async () => {
@@ -220,6 +341,7 @@ test("full-file side-by-side handles complete addition, deletion, empty and unch
 });
 
 test("invalid revisions and mode cannot become command-line options", async () => {
+    await assert.rejects(compare({ repo, base: "HEAD", target: "HEAD", includeUncommitted: "yes" }), /Invalid uncommitted/);
     await assert.rejects(compare({ repo, base: "--help", target: "HEAD" }), /revision|single|unknown|Needed/);
     await assert.rejects(compare({ repo, base: "main", target: "HEAD", mode: "bad" }), /Unknown comparison/);
     await assert.rejects(compare({ repo: "relative", base: "main", target: "HEAD" }), /absolute/);
@@ -242,7 +364,7 @@ test("HTTP controls expose comparison, reject stale files and cross-origin reque
         headers: { "Content-Type": "application/json", "X-Git-Changes": "1", ...headers },
         body: JSON.stringify(data),
     });
-    const response = await post("compare", { repo, base: "main", target: "feature", mode: "merge-base" });
+    const response = await post("compare", { repo, base: "main", target: "feature", mode: "merge-base", includeUncommitted: false });
     assert.equal(response.status, 200);
     const comparison = await response.json();
     assert.equal(comparison.id, result.id);
@@ -355,6 +477,11 @@ test("a workspace without its first commit still selects its repository and bran
         assert.equal(settings.base, "HEAD");
         assert.equal(workspace.source, "workspace");
         assert.equal((await repository(emptyRepo)).unborn, true);
+        await writeFile(join(emptyRepo, "new.txt"), "before first commit\n");
+        const snapshot = await compare({ repo: emptyRepo, base: "HEAD", target: "new-project", includeUncommitted: true });
+        assert.deepEqual(snapshot.files.map((file) => file.path), ["new.txt"]);
+        assert.equal((await fileSources(snapshot, "new.txt")).target.text, "before first commit\n");
+        await rm(join(emptyRepo, "new.txt"));
         assert.equal(await git(emptyRepo, ["status", "--porcelain=v1"]), status);
     } finally {
         await emptyPanel?.close();

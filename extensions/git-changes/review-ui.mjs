@@ -28,11 +28,16 @@ export function createReviewUI({ request, getState, openAnchor, showError }) {
         const file = getState().comparison?.files.find((item) => item.path === thread.anchor.path);
         return (thread.anchor.side === "base" ? file?.baseObject : file?.targetObject)?.id !== thread.anchor.blob;
     }
-    function stateLabel(thread) {
-        if (thread.resolved) return "Resolved";
+    function threadStatus(thread) {
+        if (thread.resolved) return { state: "resolved", label: "Resolved" };
         const lastUser = thread.messages.filter((message) => message.author === "user").at(-1);
-        if (thread.messages.some((message) => message.author === "agent" && message.replyTo === lastUser.id)) return "Agent replied · Awaiting your decision";
-        return { pending: "Saved · Sending or awaiting confirmation", sent: "Sent to conversation · Awaiting reply", uncertain: "Delivery uncertain · Check the conversation before sending again" }[lastUser.delivery.state];
+        if (thread.messages.some((message) => message.author === "agent" && message.replyTo === lastUser.id)) return { state: "replied", label: "Agent replied · Awaiting your decision" };
+        if (lastUser.processingAt) return { state: "processing", label: "Processing · Agent is handling this comment" };
+        return {
+            pending: { state: "waiting", label: "Waiting · Sending to conversation" },
+            sent: { state: "waiting", label: "Waiting · Queued for the agent" },
+            uncertain: { state: "uncertain", label: "Delivery uncertain · Check the conversation before sending again" },
+        }[lastUser.delivery.state];
     }
     function currentSelection() {
         const state = getState();
@@ -114,13 +119,20 @@ export function createReviewUI({ request, getState, openAnchor, showError }) {
         navigation();
         const fragment = document.createDocumentFragment();
         for (const thread of threads) {
+            const status = threadStatus(thread);
             const card = element("details", `review-thread${thread.id === activeId ? " selected" : ""}`);
             card.dataset.thread = thread.id;
+            card.dataset.state = status.state;
             card.open = !thread.resolved || expanded.has(thread.id);
             card.addEventListener("toggle", () => {
                 if (thread.resolved) card.open ? expanded.add(thread.id) : expanded.delete(thread.id);
             });
-            card.append(element("summary", "", `${thread.resolved ? "✓ " : ""}${thread.anchor.path} · ${location(thread.anchor)} · ${stateLabel(thread)}`));
+            const summary = element("summary");
+            summary.append(element("span", "review-location", `${thread.anchor.path} · ${location(thread.anchor)}`));
+            const badge = element("span", `review-status ${status.state}`, status.label);
+            badge.setAttribute("role", "status");
+            summary.append(badge);
+            card.append(summary);
             const controls = element("div", "review-thread-controls");
             controls.append(action(stale(thread) ? "Original reference (outdated)" : "Go to code", () => locate(thread)));
             controls.append(action(thread.resolved ? "Reopen" : "Resolve", async () => {
@@ -130,12 +142,12 @@ export function createReviewUI({ request, getState, openAnchor, showError }) {
             card.append(controls);
             if (stale(thread)) card.append(element("p", "review-warning", "The code has changed or the file is no longer in this diff. This is the original reference; old line numbers will not be used to navigate the new code."));
             const quote = element("details", "review-quote");
-            quote.append(element("summary", "", `Quoted code · ${thread.anchor.commit.slice(0, 10)} · ${location(thread.anchor)}`), element("pre", "", thread.anchor.quote));
+            quote.append(element("summary", "", `Quoted code · ${thread.anchor.commit === "Working tree" ? thread.anchor.commit : thread.anchor.commit.slice(0, 10)} · ${location(thread.anchor)}`), element("pre", "", thread.anchor.quote));
             card.append(quote);
             for (const message of thread.messages) {
                 const item = element("div", `review-message ${message.author}`);
                 item.append(element("strong", "", message.author === "agent" ? "Agent" : "You"), element("p", "", message.body));
-                if (message.delivery?.state === "uncertain") item.append(element("p", "review-warning", `${stateLabel(thread)}. ${message.delivery.error}`));
+                if (message.delivery?.state === "uncertain") item.append(element("p", "review-warning", `Delivery uncertain · Check the conversation before sending again. ${message.delivery.error}`));
                 card.append(item);
             }
             if (!thread.resolved) {
@@ -169,7 +181,7 @@ export function createReviewUI({ request, getState, openAnchor, showError }) {
         const response = await request("reviews");
         if (version !== refreshVersion || getState().comparison?.id !== id || response.comparisonId !== id) return;
         enabled = response.enabled;
-        threads = response.threads.sort((a, b) => a.anchor.path.localeCompare(b.anchor.path)
+        threads = response.threads.sort((a, b) => Number(a.resolved) - Number(b.resolved) || a.anchor.path.localeCompare(b.anchor.path)
             || a.anchor.startLine - b.anchor.startLine || a.anchor.startColumn - b.anchor.startColumn);
         // Preserve textareas and focus when SSE arrives while the user is typing.
         const focused = document.activeElement;

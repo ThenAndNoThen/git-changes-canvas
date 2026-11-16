@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { readFile, mkdir, rename, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, normalize } from "node:path";
-import { compare, fileDiff, fileSources, repository } from "./git.mjs";
+import { compare, disposeComparison, fileDiff, fileSources, repository } from "./git.mjs";
 import { reviewAnchor } from "./reviews.mjs";
 
 const directory = dirname(fileURLToPath(import.meta.url));
@@ -65,6 +65,7 @@ export async function initialSettings(input, saved, workingDirectory) {
             base: input.base ?? info.defaultBase,
             target: input.target ?? info.head,
             mode: input.mode ?? "merge-base",
+            includeUncommitted: input.includeUncommitted ?? stored?.includeUncommitted ?? true,
             view: stored?.view ?? "split",
             wrap: stored?.wrap ?? false,
             fullFile: stored?.fullFile ?? false,
@@ -114,17 +115,24 @@ export async function createPanel(input, storageFile = storage, context = {}) {
     async function runComparison(values) {
         const revision = ++generation;
         const result = await compare(values);
-        if (revision !== generation) throw new Error("Comparison superseded by a newer request.");
-        const next = {
-            ...settings, repo: result.repo, base: values.base, target: values.target, mode: result.mode,
-            selectedPath: settings.repo === result.repo ? settings.selectedPath : "",
-        };
-        await save(result.repo, next, storageFile);
-        if (revision !== generation) throw new Error("Comparison superseded by a newer request.");
-        settings = next;
-        comparison = result;
-        notify();
-        return result;
+        try {
+            if (revision !== generation) throw new Error("Comparison superseded by a newer request.");
+            const next = {
+                ...settings, repo: result.repo, base: values.base, target: values.target, mode: result.mode,
+                includeUncommitted: result.includeUncommitted,
+                selectedPath: settings.repo === result.repo ? settings.selectedPath : "",
+            };
+            await save(result.repo, next, storageFile);
+            if (revision !== generation) throw new Error("Comparison superseded by a newer request.");
+            const previous = comparison;
+            settings = next;
+            comparison = result;
+            await disposeComparison(previous);
+            notify();
+            return result;
+        } finally {
+            if (comparison !== result) await disposeComparison(result);
+        }
     }
 
     async function getFile(path, id, includeSources = false) {
@@ -261,10 +269,13 @@ export async function createPanel(input, storageFile = storage, context = {}) {
         file: getFile,
         summary: () => ({ settings, workspace, transport, comparison: comparison && { ...comparison, files: undefined, skipped: undefined, skippedFileCount: comparison.skipped.length } }),
         close: async () => {
+            ++generation;
             unsubscribe?.();
             for (const client of clients) client.end();
             server.closeIdleConnections();
             await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+            await disposeComparison(comparison);
+            comparison = null;
         },
     };
 }

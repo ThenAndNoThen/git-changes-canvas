@@ -20,9 +20,10 @@
         <label class="mode-field">Compare mode<select id="mode"><option value="merge-base">Since divergence · A...B</option><option value="endpoints">Endpoints · A B</option></select></label>
         <button id="compare" type="button" class="primary">Compare / Refresh</button>
       </div>
+      <label class="uncommitted-option"><input id="include-uncommitted" type="checkbox" checked>Include uncommitted changes when Target B is HEAD</label>
     </div>
   </header>
-  <div id="scope-note" class="scope-note" role="status">Local Git objects only · No checkout required · No downloads</div>
+  <div id="scope-note" class="scope-note" role="status">Local commits and working-tree snapshots · No checkout required · No downloads</div>
   <div id="error" role="alert" hidden></div>
   <main>
     <aside aria-label="Changed files">

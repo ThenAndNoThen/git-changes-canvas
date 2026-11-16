@@ -25,6 +25,7 @@ const comparisonProperties = {
     base: { type: "string", minLength: 1 },
     target: { type: "string", minLength: 1 },
     mode: { type: "string", enum: ["merge-base", "endpoints"] },
+    includeUncommitted: { type: "boolean", description: "Include staged, unstaged and untracked changes when target resolves to HEAD (default true)." },
 };
 
 function panel(instanceId) {
@@ -37,9 +38,9 @@ session = await joinSession({
     tools: [
         {
             name: "git_changes_review_read",
-            description: "Read a Git Changes review thread in this session, including its pinned code range and user/agent conversation.",
+            description: "Read a Git Changes review thread and mark its latest unanswered user comment as processing, including its pinned code range and conversation.",
             parameters: { type: "object", properties: { threadId: { type: "string" } }, required: ["threadId"], additionalProperties: false },
-            handler: (input) => reviewTool(async () => (await reviews()).read(input.threadId)),
+            handler: (input) => reviewTool(async () => (await reviews()).markProcessing(input.threadId)),
         },
         {
             name: "git_changes_review_reply",
@@ -55,7 +56,7 @@ session = await joinSession({
     canvases: [createCanvas({
         id: "git-changes",
         displayName: "Git Changes",
-        description: "Read-only branch diff using local Git objects, including un-checked-out files, with side-by-side views and no downloads.",
+        description: "Read-only local branch and uncommitted diff, with side-by-side views, review comments and no downloads.",
         inputSchema: {
             type: "object",
             additionalProperties: false,
@@ -64,7 +65,7 @@ session = await joinSession({
         actions: [
             {
                 name: "compare",
-                description: "Compare two local Git refs; merge-base mode is git diff A...B, endpoints is git diff A B. Does not fetch or modify the repository.",
+                description: "Compare local refs using merge-base or endpoint mode. Includes a frozen working-tree snapshot by default when target is HEAD. Does not fetch or modify the repository.",
                 inputSchema: {
                     type: "object", additionalProperties: false,
                     properties: comparisonProperties, required: ["repo", "base", "target"],
@@ -82,7 +83,7 @@ session = await joinSession({
             },
             {
                 name: "get_file",
-                description: "Get a changed file's parsed diff; optionally include complete local Git source text for both compared versions.",
+                description: "Get a changed file's parsed diff; optionally include complete pinned source text for both compared versions, including uncommitted snapshots.",
                 inputSchema: {
                     type: "object", additionalProperties: false,
                     properties: { path: { type: "string", minLength: 1 }, includeSources: { type: "boolean" } }, required: ["path"],

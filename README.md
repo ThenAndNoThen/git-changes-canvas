@@ -4,11 +4,11 @@ A read-only Git branch comparison canvas for the GitHub Copilot desktop app, wit
 
 ## Features
 
-- Compare any local Git refs using endpoint comparison (`A B`) or common-ancestor comparison (`A...B`), with automatic detection of the owning session's worktree and current branch.
+- Compare any local Git refs using endpoint comparison (`A B`) or common-ancestor comparison (`A...B`), with automatic detection of the owning session's worktree and current branch. When target B resolves to current HEAD, staged, unstaged and untracked changes are included by default; uncheck "Include uncommitted changes" for a commit-only comparison. Other target revisions remain commit-only.
 - Filter files, view addition/deletion counts, switch between split/unified diffs and split/single-column full-file views, enable syntax highlighting and wrapping, and navigate changes across files.
 - Add comments using the `+` to the left of a line number, shown on hover or code selection. Partial-line selections and Shift-click multi-line selections are supported.
-- Send comments to the conversation that owns the canvas. The main agent replies through dedicated tools; users can follow up or resolve threads. Resolved threads collapse by default.
-- Navigate comments independently of changes. Comments are pinned to their original Git blobs and marked outdated when code changes, rather than jumping to incorrect locations.
+- Send comments to the conversation that owns the canvas. Colored status labels distinguish waiting (amber), processing (blue), replied (green), uncertain delivery (red), and resolved (muted). Resolved threads collapse and move below unresolved threads; reopening restores their file/line order.
+- Navigate comments independently of changes. Diffs, full-file views and comments use frozen snapshots, including uncommitted content; comments are marked outdated after refreshing changed code rather than jumping to incorrect locations.
 - No branch switching, workspace modifications, or Git object downloads. Files with missing local objects are explicitly reported as skipped.
 
 ## Installation and sharing
@@ -48,12 +48,12 @@ The app also offers "Share extension as gist...", but do not share an installati
 ## Code review workflow
 
 1. Hover over a line number and click the `+` on its left, or select code and click the `+` beside the last selected line. Write a comment and choose "Send to conversation".
-2. The extension queues the comment into its owning session through SDK `session.send`, preserving existing permissions, mode, and approval flows. The main agent reads the thread with `git_changes_review_read` and responds with `git_changes_review_reply`; it does not automatically resolve the thread.
-3. Use "Send reply" to follow up or "Resolve" to close the thread. Resolved threads collapse and can be expanded to view their history or reopened. Comment navigation visits unresolved threads only.
+2. The extension queues the comment into its owning session through SDK `session.send`, preserving existing permissions, mode, and approval flows. The status changes from waiting to processing when the main agent reads the thread with `git_changes_review_read`, and to replied after `git_changes_review_reply`; delivery alone does not imply processing.
+3. Use "Send reply" to follow up or "Resolve" to close the thread. Resolved threads collapse, move to the bottom, and can be expanded to view their history or reopened. Comment navigation visits unresolved threads only; the agent never resolves threads automatically.
 
 Comments persist locally across panel closure, extension reloads, and session restoration. Quoted code and user comments are sent to the model used by the session, so the session's data policies and model usage limits still apply. The extension does not post comments to GitHub or Azure DevOps pull requests.
 
-Comments refer to historical commits, which may differ from the current files on disk. The agent must inspect the actual workspace first and explain missing permissions, path mismatches, or unclear requests in its reply. If delivery fails with an uncertain outcome, the comment is preserved with a warning and is not resent automatically.
+Comments refer to pinned commit or working-tree snapshots, which may differ from the current files on disk. The agent must inspect the actual workspace first and explain missing permissions, path mismatches, or unclear requests in its reply. If delivery fails with an uncertain outcome, the comment is preserved with a warning and is not resent automatically.
 
 ## Development and validation
 
