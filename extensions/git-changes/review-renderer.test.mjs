@@ -17,6 +17,9 @@ try {
     await git(root, ["config", "core.autocrlf", "false"]);
     await writeFile(join(root, "first.cs"), 'public class Demo {\n    string Value = "before";\n    int Count = 1;\n}\n');
     await writeFile(join(root, "second.cs"), "public class Second {}\n");
+    const deletedText = "public class Deleted {}\n// removed line\n";
+    const addedText = "public class Added {}\n// new line\n";
+    await writeFile(join(root, "z-deleted.cs"), deletedText);
     await git(root, ["add", "."]);
     await git(root, ["commit", "-m", "base"]);
     await git(root, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
@@ -24,6 +27,8 @@ try {
     await git(root, ["switch", "-c", "feature"]);
     await writeFile(join(root, "first.cs"), 'public class Demo {\n    string Value = "<script>unsafe</script>";\n    int Count = 42;\n}\n');
     await writeFile(join(root, "second.cs"), "public class ChangedSecond {}\n");
+    await rm(join(root, "z-deleted.cs"));
+    await writeFile(join(root, "z-added.cs"), addedText);
     await git(root, ["add", "."]);
     await git(root, ["commit", "-m", "feature"]);
     await writeFile(join(root, "first.cs"), 'public class Demo {\n    string Value = "<script>unsafe</script>";\n    int Count = 43;\n}\n');
@@ -51,6 +56,9 @@ try {
     await frame.locator(".change-anchor").first().waitFor();
     await frame.locator("#full-file").click();
     await frame.locator(".full-split").waitFor();
+    await frame.locator("#pane-resize").press("ArrowRight");
+    await frame.locator("#diff").evaluate(() => new Promise((resolve) => requestAnimationFrame(resolve)));
+    assert(Number(await frame.locator("#pane-resize").getAttribute("aria-valuenow")) > 50);
     assert.equal(await frame.locator("#add-comment").count(), 0);
     const lineNumber = (side, line) => frame.locator(`#diff .number[data-source-side="${side}"][data-line="${line}"]`);
     const hoverLine = lineNumber("base", 2);
@@ -67,7 +75,7 @@ try {
     await hoverButton.click();
     assert.match(await frame.locator("#review-selection").textContent(), /A · L2:1–L2:/);
     await frame.locator("#review-cancel").click();
-    await frame.locator(".brand").hover();
+    await frame.locator(".compare-row").hover();
     await frame.locator("#diff").evaluate((diff) => {
         const first = diff.querySelector('.code[data-source-side="target"][data-line="2"] .code-text');
         const last = diff.querySelector('.code[data-source-side="target"][data-line="3"] .code-text');
@@ -199,6 +207,43 @@ try {
     await firstCard.getByRole("button", { name: "Send reply", exact: true }).click();
     await firstCard.locator(".review-status.uncertain").waitFor();
     assert.notEqual(await firstCard.locator(".review-status").evaluate((node) => getComputedStyle(node).color), waitingColor);
+    failSend = false;
+    for (const [path, side, quote] of [["z-added.cs", "target", addedText], ["z-deleted.cs", "base", deletedText]]) {
+        if (await frame.locator("#full-file").getAttribute("aria-pressed") === "true") await frame.locator("#full-file").click();
+        await frame.locator(`[data-path="${path}"]`).click();
+        await frame.locator("#full-file:not(:disabled)").waitFor();
+        await lineNumber(side, 2).locator(".line-comment:not(:disabled)").waitFor();
+        await lineNumber(side, 1).locator(".line-number").click();
+        await lineNumber(side, 2).locator(".line-number").click({ modifiers: ["Shift"] });
+        await lineNumber(side, 2).locator(".line-comment").click();
+        assert.match(await frame.locator("#review-selection").textContent(), /L1:1–L2:/);
+        const count = store.list().length;
+        await frame.locator("#review-body").fill(`Review the single panel for ${path}`);
+        await frame.locator("#review-submit").click();
+        for (let i = 0; i < 50 && store.list().length === count; i++) await page.waitForTimeout(20);
+        assert.equal(store.list().length, count + 1);
+        const created = store.list().find((thread) => thread.anchor.path === path);
+        assert.equal(created.anchor.side, side);
+        assert.equal(created.anchor.quote, quote.trimEnd());
+        assert.equal(created.anchor.startLine, 1);
+        assert.equal(created.anchor.endLine, 2);
+        await frame.locator("#comment-prev:not(:disabled)").waitFor();
+        await frame.locator("#comment-prev").click();
+        await frame.locator("#comment-next:not(:disabled)").waitFor();
+        await frame.locator("#comment-next").click();
+        await frame.locator(`.file[data-path="${path}"][aria-selected="true"]`).waitFor();
+        await frame.locator(`.code.review-highlight[data-source-side="${side}"]`).first().waitFor();
+        assert.equal(await frame.locator("#full-file").getAttribute("aria-pressed"), "true");
+        assert.equal(await frame.locator("#view").isDisabled(), true);
+        assert.equal(await frame.locator(".full-split").count(), 0);
+        assert.equal(await frame.locator(".full-table .code-text").count(), 2);
+        assert.equal(await frame.locator("#right-label").isVisible(), false);
+        assert.equal(await frame.locator("#pane-resize").isVisible(), false);
+        await lineNumber(side, 2).locator(".line-number").click();
+        await lineNumber(side, 2).locator(".line-comment").click();
+        assert.match(await frame.locator("#review-selection").textContent(), new RegExp(`${side === "base" ? "A" : "B"} · L2:1–L2:`));
+        await frame.locator("#review-cancel").click();
+    }
     assert.doesNotMatch(await frame.locator("body").innerText(), /\p{Script=Han}/u);
     assert.deepEqual(errors, []);
     console.log("PASS: gutter hover/selection controls, keyboard commenting, range preservation, dispatch, replies, persistence and stale anchors.");

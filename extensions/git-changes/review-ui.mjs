@@ -69,8 +69,9 @@ export function createReviewUI({ request, getState, openAnchor, showError }) {
         const state = getState();
         for (const cell of $("diff").querySelectorAll(".code[data-source-side]")) {
             const previous = cell.previousElementSibling;
+            const numbers = cell.parentElement.querySelectorAll(".number");
             const number = previous?.classList.contains("number") ? previous
-                : cell.parentElement.querySelectorAll(".number")[cell.dataset.sourceSide === "base" ? 0 : 1];
+                : numbers[numbers.length === 1 || cell.dataset.sourceSide === "base" ? 0 : 1];
             if (number?.classList.contains("number")) {
                 number.dataset.sourceSide = cell.dataset.sourceSide;
                 number.dataset.line = cell.dataset.line;

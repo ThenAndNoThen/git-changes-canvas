@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readFile, mkdir, rename, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, normalize } from "node:path";
@@ -27,7 +27,8 @@ function save(repo, patch, storageFile = storage) {
     const pending = writes.then(async () => {
         const current = await preferences(storageFile);
         const previous = current.repositories.find((item) => item.repo === repo) ?? { repo };
-        current.repositories = [{ ...previous, ...patch }, ...current.repositories.filter((item) => item.repo !== repo)].slice(0, 20);
+        const updates = typeof patch === "function" ? patch(previous) : patch;
+        current.repositories = [{ ...previous, ...updates }, ...current.repositories.filter((item) => item.repo !== repo)].slice(0, 20);
         current.lastRepo = repo;
         await mkdir(dirname(storageFile), { recursive: true });
         const temporary = `${storageFile}.${process.pid}.tmp`;
@@ -37,6 +38,12 @@ function save(repo, patch, storageFile = storage) {
     // Keep later writes available; the failed operation still rejects for its caller.
     writes = pending.catch(() => {});
     return pending;
+}
+
+function fileReviewVersion(file) {
+    return createHash("sha256").update(JSON.stringify([
+        file.path, file.status, file.oldPath, file.baseObject.mode, file.baseObject.id, file.targetObject.mode, file.targetObject.id,
+    ])).digest("hex");
 }
 
 export async function initialSettings(input, saved, workingDirectory) {
@@ -53,10 +60,6 @@ export async function initialSettings(input, saved, workingDirectory) {
             // A standalone chat has a scratch directory, not a Git worktree.
             if (!/^fatal: not a git repository/m.test(error.message)) throw error;
         }
-    }
-    if (!info && saved.lastRepo) {
-        info = await repository(saved.lastRepo);
-        source = "recent";
     }
     const stored = saved.repositories.find((item) => normalize(item.repo) === info?.repo);
     return {
@@ -213,6 +216,15 @@ export async function createPanel(input, storageFile = storage, context = {}) {
             if (req.method === "GET" && route === "reviews") {
                 return json(res, 200, { enabled: !!context.reviews, comparisonId: comparison?.id, threads: currentThreads() });
             }
+            if (req.method === "GET" && route === "file-reviews") {
+                const snapshot = comparison;
+                const stored = (await preferences(storageFile)).repositories.find((item) => item.repo === snapshot?.repo);
+                const reviewed = new Set((stored?.reviewedFiles ?? []).map((file) => file.version));
+                return json(res, 200, {
+                    comparisonId: snapshot?.id,
+                    paths: (snapshot?.files ?? []).filter((file) => reviewed.has(fileReviewVersion(file))).map((file) => file.path),
+                });
+            }
             if (req.method !== "POST" || req.headers["x-git-changes"] !== "1" || !req.headers["content-type"]?.startsWith("application/json")) {
                 return json(res, 405, { error: "Use a same-origin JSON POST." });
             }
@@ -227,6 +239,24 @@ export async function createPanel(input, storageFile = storage, context = {}) {
             if (route === "file") {
                 if (data.includeSources !== undefined && typeof data.includeSources !== "boolean") throw new Error("Invalid source option.");
                 return json(res, 200, await getFile(data.path, data.comparisonId, data.includeSources === true));
+            }
+            if (route === "file-reviews") {
+                const snapshot = comparison;
+                if (!snapshot || data.comparisonId !== snapshot.id) throw new Error("The comparison has changed. Refresh before marking files reviewed.");
+                if (typeof data.reviewed !== "boolean") throw new Error("Invalid file review state.");
+                const directory = data.directory !== undefined;
+                if (directory && (typeof data.directory !== "string" || !data.directory || data.path !== undefined)) throw new Error("Specify a directory or a file, not both.");
+                const files = snapshot.files.filter((file) => directory ? file.path.startsWith(`${data.directory}/`) : file.path === data.path);
+                if (!files.length) throw new Error("No matching files belong to the current comparison.");
+                const entries = files.map((file) => ({ path: file.path, version: fileReviewVersion(file) }));
+                const versions = new Set(entries.map((entry) => entry.version));
+                await save(snapshot.repo, (previous) => {
+                    if (snapshot !== comparison) throw new Error("The comparison has changed. Refresh before marking files reviewed.");
+                    const reviewedFiles = (previous.reviewedFiles ?? []).filter((entry) => !versions.has(entry.version));
+                    if (data.reviewed) reviewedFiles.push(...entries);
+                    return { reviewedFiles };
+                }, storageFile);
+                return json(res, 200, { saved: true });
             }
             if (route.startsWith("reviews/")) {
                 if (!context.reviews) throw new Error("This panel is not connected to the conversation's review service.");

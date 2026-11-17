@@ -4,6 +4,7 @@ import { createReviewUI } from "./review-ui.mjs";
 
 const $ = (id) => document.getElementById(id);
 let comparison = null;
+let repositoryPath = "";
 let currentFile = null;
 let selectedPath = "";
 let visibleFiles = [];
@@ -15,8 +16,21 @@ let comparing = false;
 let navigating = false;
 let persistTimer;
 let coloring = { left: null, right: null };
+let preferredView = "split";
+let splitRatio = .5;
+let panePointer = null;
+let paneFrame = 0;
+let reviewedPaths = new Set();
+let completedFolders = new Set();
+const collapsedFolders = new Set();
+const searchCollapsedFolders = new Set();
+const pendingFileReviews = new Map();
+let fileReviewRequest = 0;
+let treeFocus = "";
 
 const isFullFile = () => $("full-file").getAttribute("aria-pressed") === "true";
+const singleSourceSide = () => currentFile?.status === "A" ? "target" : currentFile?.status === "D" ? "base" : null;
+const isSplit = () => !singleSourceSide() && preferredView === "split";
 const baseLabel = () => comparison.left === null ? "Empty tree" : comparison.mode === "merge-base" ? "Common ancestor" : comparison.base;
 const targetRevision = () => comparison.includesUncommitted ? "Working tree" : comparison.right.slice(0, 10);
 
@@ -73,6 +87,8 @@ function empty(title, detail) {
     $("diff").replaceChildren(box);
     $("pane-labels").hidden = true;
     $("horizontal").hidden = true;
+    $("pane-resize").hidden = true;
+    stopPaneResize();
 }
 
 function updateModeHint() {
@@ -86,7 +102,7 @@ function remember() {
     if (!comparison) return;
     const values = {
         comparisonId: comparison.id, selectedPath,
-        view: $("view").value, wrap: $("wrap").getAttribute("aria-pressed") === "true",
+        view: preferredView, wrap: $("wrap").getAttribute("aria-pressed") === "true",
         fullFile: isFullFile(),
     };
     persistTimer = setTimeout(() => request("preferences", values).catch(showError), 200);
@@ -96,26 +112,132 @@ function navigationState() {
     const index = visibleFiles.findIndex((file) => file.path === selectedPath);
     const busy = comparing || navigating || !currentFile;
     $("full-file").disabled = !currentFile;
+    $("view").disabled = !currentFile || !!singleSourceSide();
     $("prev").disabled = busy || (active <= 0 && index <= 0);
     $("next").disabled = busy || (active >= anchors.length - 1 && index >= visibleFiles.length - 1);
     $("position").textContent = `${active < 0 ? 0 : active + 1} / ${anchors.length}`;
 }
 
-function renderFiles() {
-    const query = $("filter").value.trim().toLocaleLowerCase();
-    visibleFiles = (comparison?.files ?? []).filter((file) => `${file.path}\n${file.oldPath ?? ""}`.toLocaleLowerCase().includes(query));
-    $("file-count").textContent = query ? `${visibleFiles.length} / ${comparison.files.length}` : String(visibleFiles.length);
-    const fragment = document.createDocumentFragment();
-    for (const file of visibleFiles) {
-        const button = node("button", "file");
-        button.type = "button";
-        button.setAttribute("role", "option");
-        button.setAttribute("aria-selected", String(file.path === selectedPath));
-        button.dataset.path = file.path;
-        button.title = `${file.oldPath ? `${file.oldPath} → ` : ""}${file.path}`;
-        const names = node("span", "file-names");
+function fileTree() {
+    const directory = (path, name) => ({ path, name, directories: new Map(), files: [], total: 0, reviewed: 0, checked: 0, pending: 0 });
+    const root = directory("", "");
+    for (const file of comparison?.files ?? []) {
         const parts = file.path.split("/");
-        names.append(node("div", "file-name", parts.pop()), node("div", "file-path", file.oldPath ? `${file.oldPath} →` : (parts.join("/") || "Repository root")));
+        parts.pop();
+        let parent = root;
+        const ancestors = [root];
+        for (const name of parts) {
+            if (!parent.directories.has(name)) parent.directories.set(name, directory(parent.path ? `${parent.path}/${name}` : name, name));
+            parent = parent.directories.get(name);
+            ancestors.push(parent);
+        }
+        parent.files.push(file);
+        const key = `${comparison.id}:${file.path}`;
+        for (const ancestor of ancestors) {
+            ancestor.total++;
+            if (reviewedPaths.has(file.path)) ancestor.reviewed++;
+            if (pendingFileReviews.get(key) ?? reviewedPaths.has(file.path)) ancestor.checked++;
+            if (pendingFileReviews.has(key)) ancestor.pending++;
+        }
+    }
+    return root;
+}
+
+async function refreshFileReviews() {
+    const version = ++fileReviewRequest;
+    const id = comparison?.id;
+    const result = await request("file-reviews");
+    if (version !== fileReviewRequest || id !== comparison?.id || result.comparisonId !== id) return;
+    reviewedPaths = new Set(result.paths);
+    const completed = new Set();
+    function visit(directory) {
+        for (const child of directory.directories.values()) {
+            if (child.total === child.reviewed) completed.add(child.path);
+            visit(child);
+        }
+    }
+    visit(fileTree());
+    for (const path of completed) if (!completedFolders.has(path)) {
+        collapsedFolders.add(path);
+        searchCollapsedFolders.add(path);
+    }
+    for (const path of completedFolders) if (!completed.has(path)) {
+        collapsedFolders.delete(path);
+        searchCollapsedFolders.delete(path);
+    }
+    completedFolders = completed;
+}
+
+async function markReviewed(target, reviewed, comparisonId) {
+    const snapshot = comparison;
+    if (snapshot?.id !== comparisonId) throw new Error("The comparison has changed. Refresh before marking files reviewed.");
+    const files = snapshot.files.filter((file) => target.directory !== undefined
+        ? file.path.startsWith(`${target.directory}/`) : file.path === target.path);
+    if (!files.length) throw new Error("These files no longer belong to the comparison. Refresh before marking them reviewed.");
+    const keys = files.map((file) => `${snapshot.id}:${file.path}`);
+    if (keys.some((key) => pendingFileReviews.has(key))) return;
+    for (const key of keys) pendingFileReviews.set(key, reviewed);
+    clearError();
+    renderFiles();
+    try {
+        await request("file-reviews", { comparisonId: snapshot.id, ...target, reviewed });
+        if (snapshot.id === comparison?.id) await refreshFileReviews();
+    } finally {
+        for (const key of keys) pendingFileReviews.delete(key);
+        renderFiles();
+    }
+}
+
+const treeKey = (item) => item?.dataset.path !== undefined ? `file:${item.dataset.path}` : item ? `directory:${item.dataset.directory}` : "";
+const treeItems = () => [...$("files").querySelectorAll('[role="treeitem"]')].filter((item) => item.getClientRects().length);
+
+function focusTreeItem(item, scroll = false) {
+    if (!item) return;
+    for (const other of $("files").querySelectorAll('[role="treeitem"]')) other.tabIndex = -1;
+    item.tabIndex = 0;
+    treeFocus = treeKey(item);
+    item.focus({ preventScroll: !scroll });
+}
+
+function toggleDirectory(path) {
+    const collapsed = $("filter").value.trim() ? searchCollapsedFolders : collapsedFolders;
+    if (collapsed.has(path)) collapsed.delete(path);
+    else collapsed.add(path);
+    treeFocus = `directory:${path}`;
+    renderFiles();
+}
+
+function renderFiles() {
+    const focused = $("files").contains(document.activeElement);
+    const focusedItem = document.activeElement.closest('[role="treeitem"]');
+    if (focused && focusedItem) treeFocus = treeKey(focusedItem);
+    const query = $("filter").value.trim().toLocaleLowerCase();
+    const collapsed = query ? searchCollapsedFolders : collapsedFolders;
+    visibleFiles = [];
+    function fileNode(file) {
+        const button = node("div", "file");
+        const comparisonId = comparison.id;
+        button.tabIndex = -1;
+        button.setAttribute("role", "treeitem");
+        button.setAttribute("aria-selected", String(file.path === selectedPath));
+        const key = `${comparison.id}:${file.path}`;
+        const checked = pendingFileReviews.get(key) ?? reviewedPaths.has(file.path);
+        button.setAttribute("aria-checked", String(checked));
+        button.setAttribute("aria-label", file.path);
+        button.dataset.path = file.path;
+        button.dataset.comparisonId = comparisonId;
+        button.title = `${file.oldPath ? `${file.oldPath} → ` : ""}${file.path}`;
+        const checkbox = node("input", "file-reviewed");
+        checkbox.type = "checkbox";
+        checkbox.tabIndex = -1;
+        checkbox.checked = checked;
+        checkbox.disabled = pendingFileReviews.has(key);
+        checkbox.setAttribute("aria-label", `Reviewed: ${file.path}`);
+        checkbox.title = "Mark this file as reviewed";
+        checkbox.addEventListener("change", () => markReviewed({ path: file.path }, checkbox.checked, comparisonId).catch(showError));
+        const names = node("span", "file-names");
+        names.append(node("div", "file-name", file.path.split("/").pop()));
+        if (file.oldPath) names.append(node("div", "file-path", `${file.oldPath} →`));
         const stat = node("span", "file-stat");
         if (file.binary) stat.textContent = "binary";
         else {
@@ -125,13 +247,72 @@ function renderFiles() {
                 stat.append(node("span", "minus", `−${file.deletions}`));
             }
         }
-        button.append(node("span", `file-status ${file.status[0]}`, file.status[0]), names);
+        button.append(checkbox, node("span", `file-status ${file.status[0]}`, file.status[0]), names);
         if (stat.hasChildNodes()) button.append(stat);
-        button.addEventListener("click", () => selectFile(file.path).catch(showError));
-        fragment.append(button);
+        button.addEventListener("click", (event) => {
+            if (event.target !== checkbox) selectFile(file.path).catch(showError);
+        });
+        return button;
     }
+    function children(directory) {
+        const fragment = document.createDocumentFragment();
+        for (const child of [...directory.directories.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+            const content = children(child);
+            if (!content.childNodes.length) continue;
+            const item = node("div", "directory");
+            const comparisonId = comparison.id;
+            item.dataset.directory = child.path;
+            item.dataset.comparisonId = comparisonId;
+            item.tabIndex = -1;
+            item.setAttribute("role", "treeitem");
+            item.setAttribute("aria-expanded", String(!collapsed.has(child.path)));
+            item.setAttribute("aria-checked", child.checked === child.total ? "true" : child.checked ? "mixed" : "false");
+            item.setAttribute("aria-label", `${child.name}, ${child.reviewed} of ${child.total} reviewed`);
+            const row = node("div", "directory-row");
+            row.title = child.path;
+            const caret = node("span", "directory-caret", collapsed.has(child.path) ? "▸" : "▾");
+            caret.setAttribute("aria-hidden", "true");
+            const checkbox = node("input", "directory-reviewed");
+            checkbox.type = "checkbox";
+            checkbox.tabIndex = -1;
+            checkbox.checked = child.checked === child.total;
+            checkbox.indeterminate = child.checked > 0 && child.checked < child.total;
+            checkbox.disabled = child.pending > 0;
+            checkbox.setAttribute("aria-label", `Reviewed directory: ${child.path}`);
+            checkbox.title = "Mark all changed files in this directory and its subdirectories as reviewed, including filtered-out files";
+            checkbox.addEventListener("change", () => markReviewed({ directory: child.path }, checkbox.checked, comparisonId).catch(showError));
+            row.append(caret, checkbox, node("span", "file-names", child.name), node("span", "directory-count", `${child.reviewed}/${child.total}`));
+            row.addEventListener("click", (event) => {
+                if (event.target === checkbox) return;
+                focusTreeItem(item);
+                toggleDirectory(child.path);
+            });
+            const group = node("div", "file-group");
+            group.setAttribute("role", "group");
+            group.hidden = collapsed.has(child.path);
+            group.append(content);
+            item.append(row, group);
+            fragment.append(item);
+        }
+        for (const file of directory.files.sort((a, b) => a.path.localeCompare(b.path))) {
+            if (!`${file.path}\n${file.oldPath ?? ""}`.toLocaleLowerCase().includes(query)) continue;
+            visibleFiles.push(file);
+            fragment.append(fileNode(file));
+        }
+        return fragment;
+    }
+    const fragment = children(fileTree());
+    $("file-count").textContent = query ? `${visibleFiles.length} / ${comparison?.files.length ?? 0}` : String(visibleFiles.length);
     if (!visibleFiles.length) fragment.append(node("div", "file-empty", query ? "No matching files" : comparison ? "No changes between these versions" : "Compare to see changed files"));
     $("files").replaceChildren(fragment);
+    let target = [...$("files").querySelectorAll('[role="treeitem"]')].find((item) => treeKey(item) === treeFocus);
+    while (target && !target.getClientRects().length) target = target.parentElement.closest('[role="treeitem"]');
+    target ??= treeItems()[0];
+    if (target) {
+        target.tabIndex = 0;
+        if (focused) focusTreeItem(target);
+    }
+    $("files").tabIndex = target ? -1 : 0;
     navigationState();
 }
 
@@ -173,17 +354,28 @@ function unifiedRow(line) {
     return row;
 }
 
+function singleDiffRow(line, side) {
+    const row = node("tr");
+    row.append(numberCell(side === "base" ? line.oldLine : line.newLine, line.type),
+        node("td", `sign ${line.type}`, { add: "+", delete: "−", context: " ", note: "\\" }[line.type]),
+        contentCell(line, "left", undefined, side === "base" ? "left" : "right"));
+    return row;
+}
+
 function renderDiff() {
     anchors = [];
     active = -1;
     $("diff").style.setProperty("--scroll-left", "0px");
     $("diff").style.setProperty("--scroll-right", "0px");
     if (!currentFile) return navigationState();
-    $("pane-labels").classList.remove("full");
-    $("right-label").hidden = false;
-    const unified = $("view").value === "unified";
+    const singleSide = singleSourceSide();
+    const unified = !singleSide && !isSplit();
+    $("pane-labels").classList.toggle("full", !!singleSide);
+    $("right-label").hidden = !!singleSide;
     $("pane-labels").hidden = unified;
-    $("left-label").textContent = `${baseLabel()} · ${comparison.from.slice(0, 10)}`;
+    $("left-label").textContent = singleSide === "target"
+        ? `Target B · ${comparison.target} · ${targetRevision()}`
+        : `${singleSide === "base" ? "Deleted file · " : ""}${baseLabel()} · ${comparison.from.slice(0, 10)}`;
     $("right-label").textContent = `${comparison.target} · ${targetRevision()}`;
     const fragment = document.createDocumentFragment();
     const metadata = currentFile.metadata.filter((line) => !line.startsWith("diff --git") && !line.startsWith("index ") && !line.startsWith("--- ") && !line.startsWith("+++ "));
@@ -191,17 +383,17 @@ function renderDiff() {
     for (const hunk of currentFile.hunks) {
         const section = node("section", "hunk");
         section.append(node("div", "hunk-header", hunk.header));
-        const table = node("table", "diff-table");
+        const table = node("table", `diff-table${isSplit() ? " split-table" : ""}`);
         const colgroup = node("colgroup");
-        for (const type of unified ? ["number", "number", "sign", ""] : ["number", "", "number", ""]) {
+        for (const type of singleSide ? ["number", "sign", ""] : unified ? ["number", "number", "sign", ""] : ["number", "left-column", "number", ""]) {
             colgroup.append(node("col", type));
         }
         table.append(colgroup);
         for (const group of groups(hunk.lines)) {
             const body = node("tbody", group.changed ? "change-anchor" : "");
             if (group.changed) anchors.push(body);
-            for (const line of unified ? group.lines : splitRows(group.lines)) {
-                body.append(unified ? unifiedRow(line) : splitRow(line));
+            for (const line of singleSide || unified ? group.lines : splitRows(group.lines)) {
+                body.append(singleSide ? singleDiffRow(line, singleSide) : unified ? unifiedRow(line) : splitRow(line));
             }
             table.append(body);
         }
@@ -229,7 +421,7 @@ function renderFullFile() {
     const target = currentFile?.sources?.target;
     const base = currentFile?.sources?.base;
     const source = target ?? base;
-    const split = $("view").value === "split";
+    const split = isSplit();
     const unavailable = split ? [base, target].find((item) => item?.text === null) : source?.text === null ? source : null;
     if (!source || unavailable) {
         const reason = unavailable?.unavailableReason || currentFile?.sources?.unavailableReason || "No text file is available for this version.";
@@ -304,9 +496,9 @@ function renderFullSplit(base, target) {
     $("right-label").hidden = false;
     $("left-label").textContent = `${baseLabel()} · ${comparison.from.slice(0, 10)} · ${base ? "Full file" : "File does not exist"}`;
     $("right-label").textContent = `${comparison.target} · ${targetRevision()} · ${target ? "Full file" : "File deleted"}`;
-    const table = node("table", "diff-table full-table full-split");
+    const table = node("table", "diff-table full-table full-split split-table");
     const colgroup = node("colgroup");
-    for (const type of ["number", "", "number", ""]) colgroup.append(node("col", type));
+    for (const type of ["number", "left-column", "number", ""]) colgroup.append(node("col", type));
     table.append(colgroup);
     for (const section of fullFileSections(leftLines, rightLines, currentFile.hunks)) {
         const body = node("tbody", section.changed ? "change-anchor" : "");
@@ -329,13 +521,27 @@ function renderFullSplit(base, target) {
 }
 
 function renderCurrent() {
+    const single = !!singleSourceSide();
+    $("view").querySelector('[value="single"]').hidden = !single;
+    $("view").value = single ? "single" : preferredView;
     if (isFullFile()) renderFullFile();
     else renderDiff();
     reviews.annotate();
 }
 
 function horizontalWidths() {
-    const unified = $("view").value === "unified";
+    const unified = !isSplit();
+    const width = $("diff").clientWidth;
+    const minimum = Math.min(160, width / 2);
+    const left = Math.max(minimum, Math.min(width - minimum, width * splitRatio));
+    $("code-view").style.setProperty("--code-width", `${width}px`);
+    $("code-view").style.setProperty("--split-position", `${left}px`);
+    const separator = $("pane-resize");
+    separator.hidden = unified || !$("diff").querySelector(".split-table .code");
+    separator.setAttribute("aria-valuemin", String(width ? Math.round(minimum / width * 100) : 50));
+    separator.setAttribute("aria-valuemax", String(width ? Math.round((width - minimum) / width * 100) : 50));
+    separator.setAttribute("aria-valuenow", String(width ? Math.round(left / width * 100) : 50));
+    if (separator.hidden) stopPaneResize();
     const wrap = $("wrap").getAttribute("aria-pressed") === "true";
     $("horizontal").hidden = wrap || !$("diff").querySelector(".code-text");
     $("horizontal").classList.toggle("unified", unified);
@@ -366,8 +572,19 @@ function activate(index, scroll = true) {
     navigationState();
 }
 
-async function selectFile(path, edge = "first") {
+function revealFile(path) {
+    const parts = path.split("/");
+    parts.pop();
+    while (parts.length) {
+        collapsedFolders.delete(parts.join("/"));
+        searchCollapsedFolders.delete(parts.join("/"));
+        parts.pop();
+    }
+}
+
+async function selectFile(path, edge = "first", reveal = true) {
     if (!comparison) return;
+    if (reveal) revealFile(path);
     const version = ++fileRequest;
     const id = comparison.id;
     currentFile = null;
@@ -415,11 +632,19 @@ async function navigate(direction) {
 
 async function applyComparison(value) {
     const changed = comparison?.id !== value.id;
+    if (comparison?.repo !== value.repo) {
+        reviewedPaths = new Set();
+        completedFolders = new Set();
+        collapsedFolders.clear();
+        searchCollapsedFolders.clear();
+        treeFocus = "";
+    }
     comparison = value;
-    $("summary").textContent = `${value.fileCount} files  ·  +${value.additions}  −${value.deletions}`;
+    await refreshFileReviews();
+    if (comparison !== value) return;
     const scope = value.includesUncommitted ? "Includes staged, unstaged and untracked changes · Frozen working-tree snapshot"
         : value.includeUncommitted ? "Committed changes only · Target B is not current HEAD" : "Committed changes only";
-    $("scope-note").textContent = `${scope} · Skipped ${value.skipped.length} files with missing history (no downloads)`;
+    $("scope-note").textContent = `${value.fileCount} files · +${value.additions} −${value.deletions} · ${scope} · Skipped ${value.skipped.length} files with missing history (no downloads)`;
     $("scope-note").title = value.skipped.slice(0, 30).map((file) => file.path).join("\n");
     renderFiles();
     const path = visibleFiles.find((file) => file.path === selectedPath)?.path ?? visibleFiles[0]?.path;
@@ -439,17 +664,17 @@ async function applyComparison(value) {
         empty(value.skipped.length ? "Required local objects are missing" : "No changes to display", $("filter").value ? "Clear the file filter to see all changes." : explanation);
         $("status").textContent = "Comparison complete";
         navigationState();
-    } else if (changed || !currentFile || selectedPath !== path) await selectFile(path);
+    } else if (changed || !currentFile || selectedPath !== path) await selectFile(path, "first", false);
     await reviews.refresh();
 }
 
 async function loadRepository(restore = true) {
     const version = ++repoRequest;
-    const repo = $("repo").value.trim();
+    const repo = repositoryPath;
     $("status").textContent = "Loading branches…";
     const info = await request("repository", { repo });
-    if (version !== repoRequest || $("repo").value.trim() !== repo) return false;
-    $("repo").value = info.repo;
+    if (version !== repoRequest || repositoryPath !== repo) return false;
+    repositoryPath = info.repo;
     const options = document.createDocumentFragment();
     for (const ref of new Set(["HEAD", info.head, ...info.refs])) {
         const option = node("option"); option.value = ref; options.append(option);
@@ -460,7 +685,8 @@ async function loadRepository(restore = true) {
     if (restore) {
         $("mode").value = "merge-base";
         $("include-uncommitted").checked = info.saved.includeUncommitted ?? true;
-        $("view").value = info.saved.view || "split";
+        preferredView = info.saved.view || "split";
+        $("view").value = preferredView;
         $("wrap").setAttribute("aria-pressed", String(info.saved.wrap ?? false));
         setFullFile(info.saved.fullFile ?? false);
         $("diff").classList.toggle("wrap", info.saved.wrap ?? false);
@@ -483,13 +709,11 @@ async function runCompare() {
     navigationState();
     try {
         const result = await request("compare", {
-            repo: $("repo").value.trim(), base: $("base").value.trim(),
+            repo: repositoryPath, base: $("base").value.trim(),
             target: $("target").value.trim(), mode: $("mode").value,
             includeUncommitted: $("include-uncommitted").checked,
         });
         await applyComparison(result);
-        const option = node("option"); option.value = result.repo;
-        if (![...$("repositories").options].some((item) => item.value === result.repo)) $("repositories").append(option);
     } finally {
         comparing = false;
         $("compare").disabled = false;
@@ -499,7 +723,8 @@ async function runCompare() {
 }
 
 function submitComparison() {
-    for (const id of ["repo", "base", "target"]) if (!$(id).reportValidity()) return;
+    if (!repositoryPath) return showError(new Error("Open Git Changes in a repository workspace before comparing branches."));
+    for (const id of ["base", "target"]) if (!$(id).reportValidity()) return;
     runCompare().catch(showError);
 }
 $("compare").addEventListener("click", submitComparison);
@@ -509,8 +734,6 @@ $("compare-form").addEventListener("keydown", (event) => {
         submitComparison();
     }
 });
-$("load-repo").addEventListener("click", () => { clearError(); loadRepository().catch(showError); });
-$("repo").addEventListener("change", () => { clearError(); loadRepository().catch(showError); });
 for (const id of ["base", "target", "mode", "include-uncommitted"]) $(id).addEventListener("input", () => {
     updateModeHint();
     $("status").textContent = "Parameters changed. Click Compare / Refresh to apply; the previous result is still displayed.";
@@ -521,8 +744,14 @@ $("swap").addEventListener("click", () => {
     $("target").value = base;
     $("status").textContent = "A and B swapped. Click Compare / Refresh to apply.";
 });
-$("filter").addEventListener("input", renderFiles);
-$("view").addEventListener("change", () => { const previous = active; renderCurrent(); activate(previous); remember(); });
+$("filter").addEventListener("input", () => { searchCollapsedFolders.clear(); renderFiles(); });
+$("view").addEventListener("change", () => {
+    preferredView = $("view").value;
+    const previous = active;
+    renderCurrent();
+    activate(previous);
+    remember();
+});
 $("full-file").addEventListener("click", () => {
     if (!currentFile) return;
     const previous = active;
@@ -552,11 +781,30 @@ document.addEventListener("keydown", (event) => {
     }
 });
 $("files").addEventListener("keydown", (event) => {
-    if (!["ArrowUp", "ArrowDown"].includes(event.key) || event.altKey) return;
+    if (event.altKey || event.target.tagName === "INPUT" || !["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "Enter", " "].includes(event.key)) return;
+    const item = event.target.closest('[role="treeitem"]');
+    if (!item) return;
     event.preventDefault();
-    const index = visibleFiles.findIndex((file) => file.path === selectedPath);
-    const destination = visibleFiles[index + (event.key === "ArrowUp" ? -1 : 1)];
-    if (destination) selectFile(destination.path).catch(showError);
+    const items = treeItems();
+    const index = items.indexOf(item);
+    if (event.key === "ArrowUp" || event.key === "ArrowDown") return focusTreeItem(items[index + (event.key === "ArrowUp" ? -1 : 1)], true);
+    if (event.key === "Home" || event.key === "End") return focusTreeItem(event.key === "Home" ? items[0] : items.at(-1), true);
+    const directory = item.dataset.directory;
+    const expanded = item.getAttribute("aria-expanded") === "true";
+    if (event.key === "ArrowLeft") {
+        if (directory !== undefined && expanded) toggleDirectory(directory);
+        else focusTreeItem(item.parentElement.closest('[role="treeitem"]'), true);
+    } else if (event.key === "ArrowRight") {
+        if (directory !== undefined && !expanded) toggleDirectory(directory);
+        else if (directory !== undefined) focusTreeItem(items[index + 1], true);
+    } else if (event.key === "Enter") {
+        if (directory !== undefined) toggleDirectory(directory);
+        else selectFile(item.dataset.path).catch(showError);
+    } else {
+        const checkbox = item.querySelector(directory !== undefined ? ":scope > .directory-row > .directory-reviewed" : ".file-reviewed");
+        const target = directory !== undefined ? { directory } : { path: item.dataset.path };
+        if (!checkbox.disabled) markReviewed(target, !checkbox.checked, item.dataset.comparisonId).catch(showError);
+    }
 });
 $("diff").addEventListener("click", (event) => {
     const index = anchors.indexOf(event.target.closest(".change-anchor"));
@@ -600,33 +848,75 @@ $("resize").addEventListener("keydown", (event) => {
 });
 new ResizeObserver(horizontalWidths).observe($("diff"));
 
+function stopPaneResize() {
+    const pointer = panePointer;
+    panePointer = null;
+    document.body.classList.remove("resizing-panes");
+    if (pointer !== null && $("pane-resize").hasPointerCapture(pointer)) $("pane-resize").releasePointerCapture(pointer);
+}
+
+function resizePanes(left) {
+    const width = $("diff").clientWidth;
+    if (!width) return;
+    const minimum = Math.min(160, width / 2);
+    splitRatio = Math.max(minimum, Math.min(width - minimum, left)) / width;
+    cancelAnimationFrame(paneFrame);
+    paneFrame = requestAnimationFrame(horizontalWidths);
+}
+
+$("pane-resize").addEventListener("pointerdown", (event) => {
+    if (!event.isPrimary || event.button !== 0) return;
+    panePointer = event.pointerId;
+    $("pane-resize").setPointerCapture(event.pointerId);
+    document.body.classList.add("resizing-panes");
+    event.preventDefault();
+    $("pane-resize").focus({ preventScroll: true });
+});
+$("pane-resize").addEventListener("pointermove", (event) => {
+    if (panePointer === event.pointerId) resizePanes(event.clientX - $("diff").getBoundingClientRect().left);
+});
+for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) $("pane-resize").addEventListener(type, stopPaneResize);
+$("pane-resize").addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+    event.preventDefault();
+    const left = parseFloat($("code-view").style.getPropertyValue("--split-position"));
+    resizePanes(left + (event.key === "ArrowLeft" ? -20 : 20));
+});
+
 const reviews = createReviewUI({
     request, showError,
     getState: () => ({ comparison, currentFile }),
     openAnchor: async (anchor) => {
         $("filter").value = "";
         setFullFile(true);
-        $("view").value = "split";
+        preferredView = "split";
         if (currentFile?.path !== anchor.path) await selectFile(anchor.path);
-        else renderCurrent();
+        else {
+            revealFile(anchor.path);
+            renderFiles();
+            renderCurrent();
+        }
         remember();
     },
 });
 
 async function boot() {
     const state = await request("state");
-    for (const repo of state.repositories) {
-        const option = node("option"); option.value = repo; $("repositories").append(option);
-    }
     const settings = state.settings;
-    $("repo").value = settings.repo || "";
-    if (!settings.repo) {
-        $("status").textContent = "No repository is associated with this conversation. Open this canvas in a repository session to detect it automatically.";
+    repositoryPath = settings.repo || "";
+    if (!repositoryPath) {
+        $("compare").disabled = true;
+        $("filename").textContent = "No repository in this workspace";
+        const detail = "Open Git Changes in a repository workspace to compare its branches.";
+        $("status").textContent = detail;
+        empty("No repository in this workspace", detail);
         return;
     }
     const info = await loadRepository();
     if (!info) return;
-    for (const key of ["base", "target", "mode", "view"]) if (settings[key]) $(key).value = settings[key];
+    for (const key of ["base", "target", "mode"]) if (settings[key]) $(key).value = settings[key];
+    preferredView = settings.view || "split";
+    $("view").value = preferredView;
     $("include-uncommitted").checked = settings.includeUncommitted ?? true;
     $("wrap").setAttribute("aria-pressed", String(settings.wrap ?? false));
     setFullFile(settings.fullFile ?? false);
@@ -648,7 +938,9 @@ events.onmessage = async () => {
     try {
         const state = await request("state");
         if (state.comparison && state.comparison.id !== comparison?.id) {
-            for (const key of ["repo", "base", "target", "mode"]) $(key).value = state.settings[key];
+            repositoryPath = state.settings.repo;
+            $("compare").disabled = false;
+            for (const key of ["base", "target", "mode"]) $(key).value = state.settings[key];
             $("include-uncommitted").checked = state.settings.includeUncommitted ?? true;
             updateModeHint();
             await applyComparison(state.comparison);

@@ -400,6 +400,104 @@ test("view settings survive reopening without overriding explicit comparison ref
     } finally { await second.close(); }
 });
 
+test("file review marks persist per worktree and compared versions without losing concurrent updates", async () => {
+    const root = await mkdtemp(join(process.cwd(), "file-review-test-"));
+    const panels = [];
+    try {
+        await git(root, ["init", "-b", "main"]);
+        await git(root, ["config", "user.name", "Canvas fixture"]);
+        await git(root, ["config", "user.email", "fixture@example.invalid"]);
+        await git(root, ["config", "core.autocrlf", "false"]);
+        await writeFile(join(root, "first.txt"), "original one\n");
+        await writeFile(join(root, "second.txt"), "original two\n");
+        await git(root, ["add", "."]);
+        await git(root, ["commit", "-m", "base"]);
+        const base = (await git(root, ["rev-parse", "HEAD"])).trim();
+        await writeFile(join(root, "first.txt"), "intermediate one\n");
+        await git(root, ["commit", "-am", "intermediate"]);
+        const alternateBase = (await git(root, ["rev-parse", "HEAD"])).trim();
+        await writeFile(join(root, "first.txt"), "target one\n");
+        await writeFile(join(root, "second.txt"), "target two\n");
+        await mkdir(join(root, "src", "nested"), { recursive: true });
+        await mkdir(join(root, "src2"));
+        for (const path of ["src/a.txt", "src/nested/b.txt", "src2/c.txt"]) await writeFile(join(root, path), "new source\n");
+        await git(root, ["add", "."]);
+        await git(root, ["commit", "-am", "target"]);
+        const storage = join(root, ".git", "file-review-settings.json");
+        const options = { repo: root, base, target: "HEAD", mode: "endpoints" };
+        async function open(repo = root) {
+            const instance = await createPanel({ repo }, storage);
+            panels.push(instance);
+            await instance.compare({ ...options, repo });
+            return instance;
+        }
+        const first = await open();
+        const second = await open();
+        const post = (instance, route, data) => fetch(instance.url + route, {
+            method: "POST", headers: { "Content-Type": "application/json", "X-Git-Changes": "1" },
+            body: JSON.stringify(data),
+        });
+        const marks = async (instance) => (await (await fetch(instance.url + "file-reviews")).json()).paths.sort();
+        const id = first.summary().comparison.id;
+        const responses = await Promise.all([
+            post(first, "file-reviews", { comparisonId: id, path: "first.txt", reviewed: true }),
+            post(second, "file-reviews", { comparisonId: id, path: "second.txt", reviewed: true }),
+            post(first, "preferences", { comparisonId: id, selectedPath: "first.txt", view: "split", wrap: false }),
+        ]);
+        assert(responses.every((response) => response.status === 200));
+        assert.deepEqual(await marks(first), ["first.txt", "second.txt"]);
+        assert.deepEqual(await marks(await open()), ["first.txt", "second.txt"]);
+        for (const data of [
+            { comparisonId: "stale", path: "first.txt", reviewed: true },
+            { comparisonId: id, path: "../outside.txt", reviewed: true },
+            { comparisonId: id, path: "first.txt", reviewed: "yes" },
+        ]) assert.equal((await post(first, "file-reviews", data)).status, 400);
+        assert.deepEqual(await marks(first), ["first.txt", "second.txt"]);
+
+        await first.compare({ ...options, base: alternateBase });
+        assert.deepEqual(await marks(first), ["second.txt"], "A changed base invalidates the mark even when the target is unchanged");
+        const alternateId = first.summary().comparison.id;
+        assert.equal((await post(first, "file-reviews", { comparisonId: alternateId, path: "first.txt", reviewed: true })).status, 200);
+        assert.deepEqual(await marks(second), ["first.txt", "second.txt"], "Reviewing another version must not replace the original version's mark");
+        assert.equal((await post(first, "file-reviews", { comparisonId: alternateId, path: "first.txt", reviewed: false })).status, 200);
+        assert.deepEqual(await marks(second), ["first.txt", "second.txt"], "Unchecking another version must not clear the original mark");
+        await first.compare(options);
+        await writeFile(join(root, "first.txt"), "new working-tree text\n");
+        await first.compare(options);
+        assert.deepEqual(await marks(first), ["second.txt"], "Changed uncommitted content must not retain an old mark");
+        assert.equal((await post(first, "file-reviews", {
+            comparisonId: first.summary().comparison.id, path: "second.txt", reviewed: false,
+        })).status, 200);
+        assert.deepEqual(await marks(first), []);
+        const currentId = first.summary().comparison.id;
+        const directoryUpdate = { comparisonId: currentId, directory: "src", reviewed: true };
+        assert.equal((await post(first, "file-reviews", directoryUpdate)).status, 200);
+        assert.deepEqual(await marks(first), ["src/a.txt", "src/nested/b.txt"], "Directory updates must include descendants but exclude similar prefixes");
+        for (const data of [
+            { ...directoryUpdate, comparisonId: "stale" },
+            { ...directoryUpdate, directory: "missing" },
+            { ...directoryUpdate, directory: "" },
+            { ...directoryUpdate, directory: 1 },
+            { ...directoryUpdate, path: "second.txt" },
+        ]) assert.equal((await post(first, "file-reviews", data)).status, 400);
+        assert.deepEqual(await marks(first), ["src/a.txt", "src/nested/b.txt"], "Rejected batch updates must leave all marks unchanged");
+        const concurrent = await Promise.all([
+            post(first, "file-reviews", { ...directoryUpdate, reviewed: false }),
+            post(first, "file-reviews", { comparisonId: currentId, path: "src2/c.txt", reviewed: true }),
+        ]);
+        assert(concurrent.every((response) => response.status === 200));
+        assert.deepEqual(await marks(first), ["src2/c.txt"], "Unchecking a directory must preserve concurrent unrelated marks");
+        const worktree = join(root, ".git", "other-worktree");
+        await git(root, ["worktree", "add", "--detach", worktree, "HEAD"]);
+        assert.deepEqual(await marks(await open(worktree)), [], "Another worktree must not inherit reviewed files");
+        const saved = JSON.parse(await readFile(storage, "utf8"));
+        assert.equal(saved.repositories.find((entry) => entry.repo === root).view, "split");
+    } finally {
+        for (const instance of panels) await instance.close();
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
 test("opaque-origin sandbox requests work only through the capability URL", async () => {
     for (const route of ["app.js", "diff-model.mjs", "syntax.mjs", "vendor/highlight.mjs", "state"]) {
         const response = await fetch(panel.url + route, { headers: { Origin: "null" } });
@@ -498,6 +596,9 @@ test("owning worktree and checked-out branch win over global history", async () 
         const nested = join(worktree, "nested");
         await mkdir(nested);
         const saved = { lastRepo: repo, repositories: [{ repo, base: "feature", target: "main" }] };
+        const noWorkspace = await initialSettings({}, saved);
+        assert.deepEqual(noWorkspace.settings, {});
+        assert.equal(noWorkspace.workspace.source, "none");
         const initial = await initialSettings({}, saved, nested);
         assert.equal(initial.settings.repo, worktree);
         assert.equal(initial.settings.base, "origin/main");

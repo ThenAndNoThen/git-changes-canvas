@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { git } from "./git.mjs";
 import { createPanel } from "./server.mjs";
@@ -20,6 +20,7 @@ try {
     const lines = Array.from({ length: 60 }, (_, i) => `// unchanged line ${i + 1}`);
     lines[0] = "public class Example {";
     lines[1] = '    public string Value = "before";';
+    lines[2] = `// ${"long unchanged content ".repeat(30)}`;
     lines[10] = "/* multi-line comment";
     lines[11] = "comment content";
     lines[12] = "*/";
@@ -31,6 +32,7 @@ try {
     await writeFile(join(root, "y-deletions.cs"), ["// removed at start", ...retained, "// removed at end"].join("\n") + "\n");
     await writeFile(join(root, "y-empty.cs"), "// remove one\n// remove two\n");
     await writeFile(join(root, "z-deleted.cs"), "public class Deleted {}\n");
+    await writeFile(join(root, "z-deleted-empty.cs"), "");
     await writeFile(join(root, "z-binary.bin"), Buffer.from([0, 1, 2]));
     await git(root, ["add", "."]);
     await git(root, ["commit", "-m", "base"]);
@@ -40,13 +42,14 @@ try {
     lines[1] = '    public string Value = "<script>alert(1)</script>";';
     lines[49] = "    public const int Limit = 42;";
     await writeFile(join(root, "first.cs"), lines.join("\n") + "\n");
-    await writeFile(join(root, "second.txt"), "new file\n");
+    await writeFile(join(root, "second.txt"), "new file");
     await writeFile(join(root, "y-align.cs"), "// before\n// new\n// middle\n// added1\n// added2\n// tail\n");
     await writeFile(join(root, "zz-empty.cs"), "");
     await writeFile(join(root, "y-deletions.cs"), retained.join("\n") + "\n");
     await writeFile(join(root, "y-empty.cs"), "");
     await writeFile(join(root, "z-binary.bin"), Buffer.from([0, 1, 3]));
     await rm(join(root, "z-deleted.cs"));
+    await rm(join(root, "z-deleted-empty.cs"));
     await git(root, ["add", "."]);
     await git(root, ["commit", "-m", "changes"]);
     const storage = join(root, ".git", "settings.json");
@@ -67,8 +70,61 @@ try {
     page.on("console", (message) => { if (message.type() === "error") failures.push(message.text()); });
     await page.goto(`http://127.0.0.1:${host.address().port}/`);
     const frame = page.frameLocator("#canvas");
+    const settleLayout = () => frame.locator("#diff").evaluate(() =>
+        new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    async function splitGeometry() {
+        await settleLayout();
+        return frame.locator("#code-view").evaluate((container) => {
+            const diff = document.getElementById("diff");
+            const origin = diff.getBoundingClientRect().left;
+            const boundaries = [...diff.querySelectorAll(".split-table tr")].map((row) =>
+                row.children[2].getBoundingClientRect().left - origin);
+            boundaries.push(document.getElementById("right-label").getBoundingClientRect().left - origin);
+            if (!document.getElementById("horizontal").hidden) boundaries.push(document.getElementById("right-scroll").getBoundingClientRect().left - origin);
+            const handle = document.getElementById("pane-resize").getBoundingClientRect();
+            boundaries.push(handle.left + handle.width / 2 - origin);
+            return { width: diff.clientWidth, left: parseFloat(container.style.getPropertyValue("--split-position")), boundaries };
+        });
+    }
+    async function assertSplit(ratio) {
+        const geometry = await splitGeometry();
+        assert(Math.abs(geometry.left / geometry.width - ratio) < .005, JSON.stringify(geometry));
+        assert(geometry.boundaries.every((left) => Math.abs(left - geometry.left) < 2), JSON.stringify(geometry));
+        assert(geometry.left >= Math.min(160, geometry.width / 2) - 1);
+        assert(geometry.width - geometry.left >= Math.min(160, geometry.width / 2) - 1);
+        assert.equal(await frame.locator("#pane-resize").isVisible(), true);
+        return geometry;
+    }
+    async function dragSplit(ratio) {
+        const handle = await frame.locator("#pane-resize").boundingBox();
+        const diff = await frame.locator("#diff").boundingBox();
+        const width = await frame.locator("#diff").evaluate((element) => element.clientWidth);
+        await page.mouse.move(handle.x + handle.width / 2, handle.y + 12);
+        await page.mouse.down();
+        await page.mouse.move(diff.x + width * ratio, handle.y + 12, { steps: 8 });
+        await page.mouse.up();
+        await settleLayout();
+        assert.equal(await frame.locator("body").evaluate((body) => body.classList.contains("resizing-panes")), false);
+    }
+    async function assertSingle(side) {
+        await settleLayout();
+        assert.equal(await frame.locator("#view").isDisabled(), true);
+        assert.equal(await frame.locator("#view").inputValue(), "single");
+        assert.equal(await frame.locator("#right-label").isVisible(), false);
+        assert.equal(await frame.locator("#right-scroll").isVisible(), false);
+        assert.equal(await frame.locator("#pane-resize").isVisible(), false);
+        assert.equal(await frame.locator(".split-table, .code.blank").count(), 0);
+        assert.equal(await frame.locator(`.code[data-source-side="${side === "base" ? "target" : "base"}"]`).count(), 0);
+        const fullWidth = await frame.locator("#diff").evaluate((diff) => {
+            const table = diff.querySelector(".diff-table");
+            return !table || Math.abs(table.getBoundingClientRect().width - diff.clientWidth) < 2;
+        });
+        assert(fullWidth, "A single panel should use the entire content width");
+    }
     await frame.locator(".change-anchor").first().waitFor();
-    assert.equal(await frame.locator("#repo").inputValue(), root);
+    assert.equal(panel.summary().settings.repo, root);
+    assert.equal(await frame.locator(".brand, .logo, .readonly, .repo-row, #repo, #load-repo, #repositories").count(), 0);
+    assert((await frame.locator("header").boundingBox()).height <= 115, "The header should contain only the comparison controls");
     assert.equal(await frame.locator("#target").inputValue(), "feature");
     assert.equal(await frame.locator("#base").inputValue(), "origin/main");
     assert.equal(await frame.locator("html").getAttribute("lang"), "en");
@@ -79,7 +135,7 @@ try {
             ["title", "placeholder", "aria-label"].map((attribute) => element.getAttribute(attribute) ?? "")),
     ].join("\n"));
     assert.doesNotMatch(interfaceText, /\p{Script=Han}/u);
-    assert.equal(await frame.locator(".file").count(), 8);
+    assert.equal(await frame.locator(".file").count(), 9);
     assert.equal(await frame.locator("[data-path='second.txt'] .file-stat").textContent(), "+1");
     assert.equal(await frame.locator("[data-path='z-deleted.cs'] .file-stat").textContent(), "−1");
     assert.equal(await frame.locator("[data-path='y-empty.cs'] .file-stat").textContent(), "−2");
@@ -92,15 +148,45 @@ try {
     assert(await frame.locator(".hljs-string.word").count() > 0);
     assert.equal(await frame.locator("#diff script").count(), 0);
     assert.equal(await frame.locator("#position").textContent(), "1 / 2");
+    await assertSplit(.5);
+    await dragSplit(.65);
+    await assertSplit(.65);
+    const beforeKey = await splitGeometry();
+    await frame.locator("#pane-resize").press("ArrowLeft");
+    await assertSplit((beforeKey.left - 20) / beforeKey.width);
+    await frame.locator("#pane-resize").press("ArrowRight");
+    await assertSplit(.65);
+    await dragSplit(-.1);
+    assert(Math.abs((await splitGeometry()).left - 160) < 1);
+    await dragSplit(.99);
+    const maximum = await splitGeometry();
+    assert(Math.abs(maximum.width - maximum.left - 160) < 1);
+    await dragSplit(.65);
+    // Cancelled drags and capture loss must not leave the page in resize mode.
+    for (const event of ["pointercancel", "lostpointercapture"]) {
+        const handle = await frame.locator("#pane-resize").boundingBox();
+        await page.mouse.move(handle.x + handle.width / 2, handle.y + 12);
+        await page.mouse.down();
+        await frame.locator("#pane-resize").dispatchEvent(event);
+        assert.equal(await frame.locator("body").evaluate((body) => body.classList.contains("resizing-panes")), false);
+        await page.mouse.up();
+    }
+    await page.setViewportSize({ width: 520, height: 1100 });
+    await assertSplit(.5);
+    await page.setViewportSize({ width: 1400, height: 1100 });
+    await assertSplit(.65);
     await frame.locator("#next").click();
     assert.equal(await frame.locator("#position").textContent(), "2 / 2");
     await frame.locator("#next").click();
     await frame.locator(".file[aria-selected=true][data-path='second.txt']").waitFor();
     await frame.locator("#prev:not(:disabled)").waitFor();
+    await assertSingle("target");
+    assert.match(await frame.locator("#diff").textContent(), /No newline at end of file/);
     await frame.locator("#prev").click();
     await frame.locator(".file[aria-selected=true][data-path='first.cs']").waitFor();
     await frame.locator("#next:not(:disabled)").waitFor();
     assert.equal(await frame.locator("#position").textContent(), "2 / 2");
+    await assertSplit(.65);
     await frame.locator("#full-file").click();
     await frame.locator(".full-split").waitFor();
     assert.equal(await frame.locator("#view").isEnabled(), true);
@@ -109,6 +195,30 @@ try {
     assert.deepEqual(await frame.locator(".full-table .code.right .code-text").allTextContents(), lines);
     assert.equal(await frame.locator("#right-label").isVisible(), true);
     assert.equal(await frame.locator("#right-scroll").isVisible(), true);
+    await assertSplit(.65);
+    const scrollBefore = await frame.locator("#diff").evaluate((diff) => diff.scrollTop);
+    await dragSplit(.6);
+    await assertSplit(.6);
+    assert.equal(await frame.locator("#diff").evaluate((diff) => diff.scrollTop), scrollBefore);
+    assert.equal(await frame.locator("#position").textContent(), "2 / 2");
+    await frame.locator("#left-scroll").evaluate((rail) => { rail.scrollLeft = rail.scrollWidth; });
+    await settleLayout();
+    const scrolling = await frame.locator("#diff").evaluate((diff) => ({
+        left: parseFloat(diff.style.getPropertyValue("--scroll-left")),
+        right: parseFloat(diff.style.getPropertyValue("--scroll-right")),
+    }));
+    assert(scrolling.left > 0 && scrolling.right === 0, "Each panel should scroll horizontally independently after resizing");
+    await frame.locator("#wrap").click();
+    await dragSplit(.65);
+    await assertSplit(.65);
+    assert.equal(await frame.locator("#horizontal").isVisible(), false);
+    const wrapped = await frame.locator(".full-split tr").nth(2).evaluate((row) => {
+        const a = row.querySelector(".code.left").getBoundingClientRect();
+        const b = row.querySelector(".code.right").getBoundingClientRect();
+        return a.top === b.top && a.height === b.height && a.height > 21;
+    });
+    assert(wrapped, "Wrapped rows should remain aligned at unequal panel widths");
+    await frame.locator("#wrap").click();
     // Measure contrast in both app themes, not just distinct CSS variable names.
     for (const mode of ["light", "dark"]) {
         const colors = await frame.locator("body").evaluate((body, mode) => {
@@ -141,6 +251,8 @@ try {
         assert(colors.addTextContrast >= 4.5 && colors.deleteTextContrast >= 4.5 && colors.commentContrast >= 4.5, JSON.stringify({ mode, colors }));
     }
     await frame.locator("#view").selectOption("unified");
+    await settleLayout();
+    assert.equal(await frame.locator("#pane-resize").isVisible(), false);
     assert.equal(await frame.locator("#full-file").getAttribute("aria-pressed"), "true");
     assert.deepEqual(await frame.locator(".full-table .code-text").allTextContents(), lines);
     assert.equal(await frame.locator(".full-table .code-text").nth(11).locator(".hljs-comment").count(), 1);
@@ -166,6 +278,7 @@ try {
     await frame.locator("#diff").press("F7");
     assert.equal(await frame.locator("#position").textContent(), "2 / 2");
     await frame.locator("#view").selectOption("split");
+    await assertSplit(.65);
     assert.equal(await frame.locator("#position").textContent(), "2 / 2");
     await frame.locator("#prev").click();
     assert.equal(await frame.locator("#position").textContent(), "1 / 2");
@@ -173,12 +286,12 @@ try {
     await frame.locator("#next").click();
     await frame.locator(".file[aria-selected=true][data-path='second.txt']").waitFor();
     await frame.locator("#prev:not(:disabled)").waitFor();
-    assert.equal(await frame.locator(".full-split").count(), 1);
-    assert.equal(await frame.locator(".full-table .code.left:not(.blank)").count(), 0);
-    assert.equal(await frame.locator(".full-table .code.right.add").textContent(), "new file");
+    await assertSingle("target");
+    assert.equal(await frame.locator(".full-table .code.add").textContent(), "new file");
     await frame.locator("#prev").click();
     await frame.locator(".file[aria-selected=true][data-path='first.cs']").waitFor();
     await frame.locator("#next:not(:disabled)").waitFor();
+    await assertSplit(.65);
     await frame.locator("#full-file").click();
     assert.equal(await frame.locator("#position").textContent(), "2 / 2");
     assert.equal(await frame.locator(".full-table").count(), 0);
@@ -200,6 +313,9 @@ try {
     await frame.locator(".change-anchor").first().waitFor();
     assert.equal(await frame.locator("#error").isVisible(), false);
     assert.equal(await frame.locator("#view").inputValue(), "unified");
+    await frame.locator("#view").selectOption("split");
+    await assertSplit(.5);
+    await frame.locator("#view").selectOption("unified");
     assert(await frame.locator(".hljs-keyword").count() > 0);
     await frame.locator("[data-path='y-deletions.cs']").click();
     await frame.locator("#full-file:not(:disabled)").waitFor();
@@ -225,6 +341,7 @@ try {
     await frame.locator("#full-file").click();
     await frame.locator("[data-path='z-deleted.cs']").click();
     await frame.locator("#full-file:not(:disabled)").waitFor();
+    await assertSingle("base");
     await frame.locator("#full-file").click();
     await frame.locator(".full-table").waitFor();
     assert.equal(await frame.locator(".full-table .code-text").textContent(), "public class Deleted {}");
@@ -234,12 +351,15 @@ try {
     await page.reload();
     await frame.locator(".full-table").waitFor();
     assert.equal(await frame.locator("#full-file").getAttribute("aria-pressed"), "true");
-    await frame.locator("#view").selectOption("split");
+    await assertSingle("base");
     assert.equal(await frame.locator(".full-table .code.left.delete").textContent(), "public class Deleted {}");
     assert.equal(await frame.locator(".full-table .code.right:not(.blank)").count(), 0);
-    assert.match(await frame.locator("#right-label").textContent(), /File deleted/);
+    assert.match(await frame.locator("#left-label").textContent(), /Deleted file/);
     await frame.locator("[data-path='y-align.cs']").click();
     await frame.locator("#full-file:not(:disabled)").waitFor();
+    assert.equal(await frame.locator("#view").inputValue(), "unified");
+    await frame.locator("#view").selectOption("split");
+    await assertSplit(.5);
     const aligned = await frame.locator(".full-split tr").evaluateAll((rows) => rows.map((row) => ({
         left: row.querySelector(".code.left:not(.blank)")?.textContent ?? null,
         right: row.querySelector(".code.right:not(.blank)")?.textContent ?? null,
@@ -268,10 +388,20 @@ try {
     await frame.locator(".full-split").waitFor();
     assert.equal(await frame.locator("#view").inputValue(), "split");
     assert.equal(await frame.locator("#full-file").getAttribute("aria-pressed"), "true");
+    await frame.locator("[data-path='y-empty.cs']").click();
+    await frame.locator("#full-file:not(:disabled)").waitFor();
+    await assertSplit(.5);
+    assert.equal(await frame.locator("#view").isEnabled(), true, "Emptying an existing file is not a deletion");
     await frame.locator("[data-path='zz-empty.cs']").click();
     await frame.locator("#full-file:not(:disabled)").waitFor();
+    await assertSingle("target");
+    assert.match(await frame.locator("#diff").textContent(), /Empty file/);
     assert.equal(await frame.locator(".full-split tr").count(), 0);
     assert.equal(await frame.locator("#position").textContent(), "0 / 0");
+    await frame.locator("[data-path='z-deleted-empty.cs']").click();
+    await frame.locator("#full-file:not(:disabled)").waitFor();
+    await assertSingle("base");
+    assert.match(await frame.locator("#diff").textContent(), /Empty file/);
     await frame.locator("[data-path='z-binary.bin']").click();
     await frame.locator("#full-file:not(:disabled)").waitFor();
     assert.match(await frame.locator("#diff").textContent(), /Binary/);
@@ -287,6 +417,10 @@ try {
     await frame.locator('.file[data-path="untracked.txt"]').waitFor();
     await frame.locator('.file[data-path="uncommitted.txt"]').click();
     await frame.getByText("working text", { exact: true }).waitFor();
+    await assertSingle("target");
+    await frame.locator('.file[data-path="untracked.txt"]').click();
+    await frame.getByText("new untracked text", { exact: true }).waitFor();
+    await assertSingle("target");
     assert.match(await frame.locator("#scope-note").textContent(), /staged, unstaged and untracked/);
     await frame.locator("#include-uncommitted").uncheck();
     await frame.locator("#compare").click();
@@ -297,6 +431,124 @@ try {
     await frame.locator(".change-anchor").first().waitFor();
     assert.equal(await frame.locator("#include-uncommitted").isChecked(), false);
 
+    for (const directory of ["src\\ui", "src\\lib", "src2"]) await mkdir(join(root, directory), { recursive: true });
+    for (const path of ["src\\ui\\a.txt", "src\\ui\\b.txt", "src\\lib\\c.txt", "src2\\other.txt", "review-root.txt"]) {
+        await writeFile(join(root, path), "review this file\nsecond line\n");
+    }
+    await frame.locator("#include-uncommitted").check();
+    await frame.locator("#compare").click();
+    const directory = (path) => frame.locator(`.directory[data-directory="${path}"]`);
+    const file = (path) => frame.locator(`.file[data-path="${path}"]`);
+    const checkbox = (path) => file(path).locator(".file-reviewed");
+    const directoryCheckbox = (path) => directory(path).locator(":scope > .directory-row > .directory-reviewed");
+    async function markReviewed(path, checked, keyboard = false) {
+        const response = page.waitForResponse((response) => response.url().endsWith("/file-reviews") && response.request().method() === "POST");
+        if (keyboard) await file(path).press(" ");
+        else await checkbox(path).setChecked(checked);
+        assert.equal((await response).status(), 200);
+        await file(path).locator(".file-reviewed:enabled").waitFor({ state: "attached" });
+        assert.equal(await checkbox(path).isChecked(), checked);
+    }
+    await directory("src/ui").waitFor();
+    assert.equal(await frame.locator("#files").getAttribute("role"), "tree");
+    assert.equal(await directory("src").locator(':scope > .file-group > .directory[data-directory="src/ui"]').count(), 1);
+    const filenameBeforeReview = await frame.locator("#filename").textContent();
+    await directory("src").locator(":scope > .directory-row").click();
+    assert.equal(await file("src/ui/a.txt").isVisible(), false);
+    await frame.locator("#filter").fill("a.txt");
+    assert.equal(await file("src/ui/a.txt").isVisible(), true);
+    await markReviewed("src/ui/a.txt", true);
+    assert.equal(await directory("src").getAttribute("aria-checked"), "mixed");
+    assert.equal(await directoryCheckbox("src/ui").evaluate((input) => input.indeterminate), true);
+    assert.equal(await directory("src/ui").getAttribute("aria-expanded"), "true", "Hidden unreviewed siblings must prevent automatic collapse");
+    assert.equal(await frame.locator("#filename").textContent(), filenameBeforeReview, "A checkbox must not open another file");
+    await frame.locator("#filter").fill("b.txt");
+    await markReviewed("src/ui/b.txt", true);
+    assert.equal(await directory("src/ui").getAttribute("aria-expanded"), "false");
+    await frame.locator("#filter").fill("");
+    assert.equal(await directory("src").getAttribute("aria-expanded"), "false", "Clearing a filter restores manual collapse state");
+    await directory("src").locator(":scope > .directory-row").click();
+    await directory("src/ui").locator(":scope > .directory-row").click();
+    await markReviewed("src/ui/a.txt", false);
+    assert.equal(await directory("src/ui").getAttribute("aria-expanded"), "true");
+    await markReviewed("src/ui/a.txt", true, true);
+    assert.equal(await directory("src/ui").getAttribute("aria-expanded"), "false");
+    assert.equal(await file("src/ui/a.txt").evaluate((item) => item.parentElement.parentElement === document.activeElement), true, "Focus should move to the collapsed directory");
+    await markReviewed("src/lib/c.txt", true);
+    assert.equal(await directory("src").getAttribute("aria-expanded"), "false", "All reviewed descendants collapse the parent too");
+    assert.equal(await directory("src2").getAttribute("aria-expanded"), "true");
+    await markReviewed("review-root.txt", true);
+    assert.equal(await file("review-root.txt").isVisible(), true);
+    await page.reload();
+    await directory("src").waitFor();
+    assert.equal(await directory("src").getAttribute("aria-expanded"), "false");
+    assert.equal(await checkbox("src/ui/a.txt").isChecked(), true);
+    assert.equal(await checkbox("review-root.txt").isChecked(), true);
+    await page.goto("about:blank");
+    await panel.close();
+    panel = await createPanel({}, storage, { workingDirectory: root });
+    await page.goto(`http://127.0.0.1:${host.address().port}/`);
+    await directory("src").waitFor();
+    assert.equal(await directory("src").getAttribute("aria-expanded"), "false");
+    assert.equal(await checkbox("src/ui/b.txt").isChecked(), true);
+    await directory("src").press("ArrowRight");
+    assert.equal(await directory("src").getAttribute("aria-expanded"), "true");
+    await directory("src/ui").press("ArrowRight");
+    await file("src/ui/a.txt").press("ArrowDown");
+    assert.equal(await file("src/ui/b.txt").evaluate((item) => item === document.activeElement), true);
+    await file("src/ui/b.txt").press("Enter");
+    await frame.locator("#full-file:not(:disabled)").waitFor();
+    assert.equal(await frame.locator("#filename").textContent(), "src/ui/b.txt");
+    await directory("src").locator(":scope > .directory-row").click();
+    await frame.locator("#diff").press("Shift+F7");
+    await frame.locator(".file[aria-selected=true][data-path='src/ui/a.txt']").waitFor();
+    assert.equal(await directory("src").getAttribute("aria-expanded"), "true");
+    assert.equal(await file("src/ui/a.txt").isVisible(), true);
+    await writeFile(join(root, "src", "ui", "a.txt"), "changed after review\n");
+    await frame.locator("#compare").click();
+    await frame.getByText("changed after review", { exact: true }).waitFor();
+    assert.equal(await checkbox("src/ui/a.txt").isChecked(), false);
+    assert.equal(await checkbox("src/ui/b.txt").isChecked(), true);
+    assert.equal(await directory("src/ui").getAttribute("aria-expanded"), "true");
+    assert.equal(await frame.locator("#error").isVisible(), false);
+
+    async function markDirectory(path, checked, keyboard = false) {
+        const response = page.waitForResponse((response) => response.url().endsWith("/file-reviews")
+            && response.request().method() === "POST" && response.request().postDataJSON().directory === path);
+        if (keyboard) await directory(path).press(" ");
+        else await directoryCheckbox(path).setChecked(checked);
+        assert.equal((await response).status(), 200);
+        await directory(path).locator(":scope > .directory-row > .directory-reviewed:enabled").waitFor({ state: "attached" });
+        assert.equal(await directoryCheckbox(path).isChecked(), checked);
+        assert.equal(await directoryCheckbox(path).evaluate((input) => input.indeterminate), false);
+    }
+    assert.equal(await directoryCheckbox("src").evaluate((input) => input.indeterminate), true);
+    await markDirectory("src", true);
+    assert.equal(await directory("src").getAttribute("aria-expanded"), "false");
+    await markDirectory("src", false, true);
+    assert.equal(await directory("src").getAttribute("aria-expanded"), "true");
+    for (const path of ["src/ui/a.txt", "src/ui/b.txt", "src/lib/c.txt"]) assert.equal(await checkbox(path).isChecked(), false);
+    assert.equal(await checkbox("review-root.txt").isChecked(), true, "Directory changes must not affect files outside it");
+    await frame.locator("#filter").fill("a.txt");
+    const selectedBeforeBatch = await frame.locator("#filename").textContent();
+    await markDirectory("src", true);
+    assert.equal(await directory("src").getAttribute("aria-expanded"), "false");
+    assert.equal(await frame.locator("#filename").textContent(), selectedBeforeBatch);
+    await frame.locator("#filter").fill("");
+    for (const path of ["src/ui/a.txt", "src/ui/b.txt", "src/lib/c.txt"]) assert.equal(await checkbox(path).isChecked(), true, "A directory checkbox must include filtered-out descendants");
+    assert.equal(await checkbox("src2/other.txt").isChecked(), false);
+    await page.reload();
+    await directory("src").waitFor();
+    assert.equal(await directoryCheckbox("src").isChecked(), true);
+    assert.equal(await directory("src").getAttribute("aria-expanded"), "false");
+    await directory("src").press("ArrowRight");
+    await markDirectory("src/ui", false);
+    assert.equal(await directoryCheckbox("src").evaluate((input) => input.indeterminate), true);
+    assert.equal(await checkbox("src/lib/c.txt").isChecked(), true);
+    await markDirectory("src", true, true);
+    assert.equal(await directory("src").getAttribute("aria-expanded"), "false", "Space on a partially reviewed directory marks all descendants reviewed");
+    assert.equal(await frame.locator("#error").isVisible(), false);
+
     const emptyRepo = await mkdtemp(join(root, "unborn-"));
     await git(emptyRepo, ["init", "-b", "new-project"]);
     await page.goto("about:blank");
@@ -304,7 +556,7 @@ try {
     panel = await createPanel({}, storage, { workingDirectory: emptyRepo });
     await page.goto(`http://127.0.0.1:${host.address().port}/`);
     await frame.locator("#diff h2", { hasText: "No changes to display" }).waitFor();
-    assert.equal(await frame.locator("#repo").inputValue(), emptyRepo);
+    assert.equal(panel.summary().settings.repo, emptyRepo);
     assert.equal(await frame.locator("#target").inputValue(), "new-project");
     assert.equal(await frame.locator("#base").inputValue(), "HEAD");
     assert.equal(await frame.locator("#error").isVisible(), false);
@@ -320,6 +572,15 @@ try {
     await frame.locator("#filename", { hasText: "No changes" }).waitFor();
     assert.equal(await frame.locator("#error").isVisible(), false);
     assert.equal(panel.summary().comparison.fileCount, 0);
+
+    await page.goto("about:blank");
+    await panel.close();
+    panel = await createPanel({}, storage);
+    await page.goto(`http://127.0.0.1:${host.address().port}/`);
+    await frame.locator("#diff h2", { hasText: "No repository in this workspace" }).waitFor();
+    assert.equal(await frame.locator("#compare").isDisabled(), true);
+    assert.equal(panel.summary().comparison, null, "A canvas without a workspace must not silently open the last repository");
+    assert.equal(await frame.locator("#error").isVisible(), false);
 
     assert.deepEqual(failures, []);
     console.log("PASS: aligned full-file split views, single-column navigation, stronger light/dark diff colors, positive-only file stats and persistence.");

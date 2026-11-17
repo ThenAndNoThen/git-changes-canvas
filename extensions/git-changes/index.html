@@ -9,9 +9,7 @@
 </head>
 <body>
   <header>
-    <div class="brand"><span class="logo" aria-hidden="true">&#177;</span><strong>Git Changes</strong><span class="readonly">READ ONLY</span><span class="spacer"></span><span id="summary">Compare branches, focus on changes</span></div>
     <div id="compare-form">
-      <div class="repo-row"><label for="repo">Repository</label><input id="repo" list="repositories" placeholder="Absolute local repository path, e.g. C:\work\repo" autocomplete="off" required><datalist id="repositories"></datalist><button id="load-repo" type="button" class="quiet">Load branches</button></div>
       <div class="compare-row">
         <label class="ref-field">Base A<input id="base" list="refs" placeholder="Branch / tag / commit" required autocomplete="off"></label>
         <button id="swap" type="button" class="icon" title="Swap base and target" aria-label="Swap base and target">&#8646;</button>
@@ -29,22 +27,25 @@
     <aside aria-label="Changed files">
       <div class="files-heading"><strong>Changed files</strong><span id="file-count" class="badge">0</span></div>
       <input id="filter" type="search" placeholder="Filter files…  Ctrl+P" aria-label="Filter changed files">
-      <div id="files" role="listbox" aria-label="Changed file list" tabindex="0"></div>
+      <div id="files" role="tree" aria-label="Changed files by directory" tabindex="0"></div>
       <div class="sidebar-footer">Local Git objects · No downloads · No branch switching</div>
     </aside>
     <div id="resize" role="separator" aria-label="Resize file list" aria-orientation="vertical" tabindex="0"></div>
     <section class="detail" aria-label="Change details">
       <div class="detail-toolbar">
-        <div id="filename" title="">Select a repository and compare branches</div>
-        <div class="view-controls"><button id="full-file" type="button" aria-pressed="false" disabled title="Show the full file in split or single-column view and navigate changes">Full file</button><select id="view" aria-label="Code layout"><option value="split">Split</option><option value="unified">Unified</option></select><button id="wrap" aria-pressed="false" title="Toggle word wrap">Wrap</button><span class="divider"></span><button id="prev" class="icon" disabled title="Previous change (Shift+F7 / Alt+↑)" aria-label="Previous change">&#8593;</button><span id="position">0 / 0</span><button id="next" class="icon" disabled title="Next change (F7 / Alt+↓)" aria-label="Next change">&#8595;</button></div>
+        <div id="filename" title="">Compare branches in the current workspace</div>
+        <div class="view-controls"><button id="full-file" type="button" aria-pressed="false" disabled title="Show the full file in split or single-column view and navigate changes">Full file</button><select id="view" aria-label="Code layout"><option value="split">Split</option><option value="unified">Unified</option><option value="single" hidden>Single column</option></select><button id="wrap" aria-pressed="false" title="Toggle word wrap">Wrap</button><span class="divider"></span><button id="prev" class="icon" disabled title="Previous change (Shift+F7 / Alt+↑)" aria-label="Previous change">&#8593;</button><span id="position">0 / 0</span><button id="next" class="icon" disabled title="Next change (F7 / Alt+↓)" aria-label="Next change">&#8595;</button></div>
       </div>
       <div class="review-toolbar">
         <button id="review-toggle" type="button" aria-expanded="false">Comments 0</button>
         <span class="spacer"></span><button id="comment-prev" type="button" disabled aria-label="Previous comment">↑ Comment</button><span id="comment-position">0 / 0</span><button id="comment-next" type="button" disabled aria-label="Next comment">↓ Comment</button>
       </div>
-      <div id="pane-labels" hidden><span id="left-label"></span><span id="right-label"></span></div>
-      <div id="diff" tabindex="0"><div class="empty"><div class="empty-icon">&#8644;</div><h2>Focus on the changes that matter</h2><p>Select base A and target B to start comparing.</p><p><strong>A...B</strong>: Common ancestor → B, showing changes since divergence.<br><strong>A B</strong>: Compare the complete trees at both endpoints.</p></div></div>
-      <div id="horizontal" hidden><div id="left-scroll" aria-label="Scroll left code horizontally"><div></div></div><div id="right-scroll" aria-label="Scroll right code horizontally"><div></div></div></div>
+      <div id="code-view">
+        <div id="pane-labels" hidden><span id="left-label"></span><span id="right-label"></span></div>
+        <div id="diff" tabindex="0"><div class="empty"><div class="empty-icon">&#8644;</div><h2>Focus on the changes that matter</h2><p>Select base A and target B to start comparing.</p><p><strong>A...B</strong>: Common ancestor → B, showing changes since divergence.<br><strong>A B</strong>: Compare the complete trees at both endpoints.</p></div></div>
+        <div id="horizontal" hidden><div id="left-scroll" aria-label="Scroll left code horizontally"><div></div></div><div id="right-scroll" aria-label="Scroll right code horizontally"><div></div></div></div>
+        <div id="pane-resize" role="separator" aria-label="Resize code panels" aria-orientation="vertical" aria-controls="diff" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50" tabindex="0" hidden></div>
+      </div>
       <section id="review-panel" aria-label="Code review comments" hidden>
         <div id="review-composer" hidden>
           <strong id="review-selection">Select code</strong>
