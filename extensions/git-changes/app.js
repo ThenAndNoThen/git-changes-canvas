@@ -256,7 +256,12 @@ function renderFiles() {
     }
     function children(directory) {
         const fragment = document.createDocumentFragment();
-        for (const child of [...directory.directories.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+        for (let child of [...directory.directories.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+            let name = child.name;
+            while (!child.files.length && child.directories.size === 1) {
+                child = child.directories.values().next().value;
+                name += `/${child.name}`;
+            }
             const content = children(child);
             if (!content.childNodes.length) continue;
             const item = node("div", "directory");
@@ -267,7 +272,7 @@ function renderFiles() {
             item.setAttribute("role", "treeitem");
             item.setAttribute("aria-expanded", String(!collapsed.has(child.path)));
             item.setAttribute("aria-checked", child.checked === child.total ? "true" : child.checked ? "mixed" : "false");
-            item.setAttribute("aria-label", `${child.name}, ${child.reviewed} of ${child.total} reviewed`);
+            item.setAttribute("aria-label", `${name}, ${child.reviewed} of ${child.total} reviewed`);
             const row = node("div", "directory-row");
             row.title = child.path;
             const caret = node("span", "directory-caret", collapsed.has(child.path) ? "▸" : "▾");
@@ -281,7 +286,7 @@ function renderFiles() {
             checkbox.setAttribute("aria-label", `Reviewed directory: ${child.path}`);
             checkbox.title = "Mark all changed files in this directory and its subdirectories as reviewed, including filtered-out files";
             checkbox.addEventListener("change", () => markReviewed({ directory: child.path }, checkbox.checked, comparisonId).catch(showError));
-            row.append(caret, checkbox, node("span", "file-names", child.name), node("span", "directory-count", `${child.reviewed}/${child.total}`));
+            row.append(caret, checkbox, node("span", "file-names", name), node("span", "directory-count", `${child.reviewed}/${child.total}`));
             row.addEventListener("click", (event) => {
                 if (event.target === checkbox) return;
                 focusTreeItem(item);
@@ -305,6 +310,11 @@ function renderFiles() {
     $("file-count").textContent = query ? `${visibleFiles.length} / ${comparison?.files.length ?? 0}` : String(visibleFiles.length);
     if (!visibleFiles.length) fragment.append(node("div", "file-empty", query ? "No matching files" : comparison ? "No changes between these versions" : "Compare to see changed files"));
     $("files").replaceChildren(fragment);
+    const directories = [...$("files").querySelectorAll(".directory")];
+    const expand = directories.some((item) => item.getAttribute("aria-expanded") === "false");
+    $("toggle-folders").disabled = !directories.length;
+    $("toggle-folders").textContent = expand ? "Expand all" : "Collapse all";
+    $("toggle-folders").title = `${expand ? "Expand" : "Collapse"} all directories${query ? " in the filtered file list" : ""}`;
     let target = [...$("files").querySelectorAll('[role="treeitem"]')].find((item) => treeKey(item) === treeFocus);
     while (target && !target.getClientRects().length) target = target.parentElement.closest('[role="treeitem"]');
     target ??= treeItems()[0];
@@ -745,6 +755,16 @@ $("swap").addEventListener("click", () => {
     $("status").textContent = "A and B swapped. Click Compare / Refresh to apply.";
 });
 $("filter").addEventListener("input", () => { searchCollapsedFolders.clear(); renderFiles(); });
+$("toggle-folders").addEventListener("click", () => {
+    const directories = [...$("files").querySelectorAll(".directory")];
+    const expand = directories.some((item) => item.getAttribute("aria-expanded") === "false");
+    const collapsed = $("filter").value.trim() ? searchCollapsedFolders : collapsedFolders;
+    for (const item of directories) {
+        if (expand) collapsed.delete(item.dataset.directory);
+        else collapsed.add(item.dataset.directory);
+    }
+    renderFiles();
+});
 $("view").addEventListener("change", () => {
     preferredView = $("view").value;
     const previous = active;

@@ -59,6 +59,7 @@ export function createReviewUI({ request, getState, openAnchor, showError }) {
         $("comment-prev").disabled = posting || index <= 0;
         $("comment-next").disabled = posting || index >= visible.length - 1;
         $("review-toggle").textContent = `Comments ${visible.length}${threads.length > visible.length ? ` · Resolved ${threads.length - visible.length}` : ""}`;
+        for (const button of $("review-list").querySelectorAll(".review-send")) button.disabled = posting;
         updateCommentButtons();
     }
     function dock() {

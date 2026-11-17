@@ -108,6 +108,7 @@ try {
     const waitingColor = await firstCard.locator(".review-status").evaluate((node) => getComputedStyle(node).color);
     confirmFirstSend();
     await firstCard.getByText("Waiting · Queued for the agent", { exact: true }).waitFor();
+    await firstCard.locator(".review-send:not(:disabled)").waitFor();
     assert.equal(first.anchor.commit, "Working tree");
     assert.equal(first.anchor.quote, 'string Value = "<script>unsafe</script>";\n    int');
     assert.equal(first.anchor.startColumn, 4);
@@ -143,6 +144,17 @@ try {
     await frame.locator(".review-thread > summary").click();
     await frame.getByRole("button", { name: "Reopen", exact: true }).click();
     await frame.getByRole("button", { name: "Resolve", exact: true }).waitFor();
+    await firstCard.locator(".review-send:not(:disabled)").waitFor();
+    await firstCard.locator(".review-reply").fill("Follow up immediately after reopening");
+    const reopenedReply = page.waitForResponse((response) => response.url().endsWith("/reviews/reply")
+        && response.request().method() === "POST");
+    await firstCard.getByRole("button", { name: "Send reply", exact: true }).click();
+    assert.equal((await reopenedReply).status(), 200);
+    await firstCard.getByText("Follow up immediately after reopening", { exact: true }).waitFor();
+    await firstCard.locator(".review-send:not(:disabled)").waitFor();
+    assert.equal(sent.length, 3, "A reopened comment must dispatch its follow-up without another refresh or navigation");
+    assert.equal(store.read(first.id).messages.at(-1).delivery.state, "sent");
+    assert.equal(await firstCard.locator(".review-reply").inputValue(), "");
     await lineNumber("target", 1).locator(".line-number").click();
     await lineNumber("target", 3).locator(".line-number").click({ modifiers: ["Shift"] });
     await lineNumber("target", 3).locator(".line-comment").click();
